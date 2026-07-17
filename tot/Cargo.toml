@@ -1,0 +1,44 @@
+[package]
+name = "axiom-tot"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+authors = ["AXIOM-Origin-Validator"]
+description = "AXIOM TOT — Tiny Outbound Tunnel: per-validator production intake for browser/WASM wallet clients"
+
+# TOT is deliberately standalone — no axiom-* protocol crates (it never
+# touches protocol types) and excluded from the validator workspace so
+# building it never perturbs that build. See docs/AXIOM_DESIGN_TOT.md §9.
+
+[[bin]]
+name = "tot"
+path = "src/main.rs"
+
+[dependencies]
+# AXC/L$/atom conversion + 乖乖 boot-canary const (denomination/src/lib.rs).
+# Every native binary in the workspace depends on this crate; if a binary
+# starts without the art it means the consolidation regressed.
+axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+seccompiler = "0.4"
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+
+[features]
+# DEV-ONLY: enables the `/fatmama/<n>` WS↔TCP tunnel so a browser dev
+# wallet can pull mail (POP3) + XAXIOM-REGISTER (SMTP) from FATMAMA through
+# TOT. Off by default → compiled out of every release build. FATMAMA is
+# dev-scoped (AXIOM_DESIGN_TOT.md §8). Enable with `--features dev-fatmama`.
+dev-fatmama = []
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true

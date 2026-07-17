@@ -1,0 +1,47 @@
+# AXIOM TOT — example configuration.
+# One TOT per validator; this file configures TOT-of-<validator>.
+# Deployed as /etc/tot/<validator>.toml (see deploy/tot@.service).
+
+# The single listen socket — serves both transports. A native client's
+# raw-TCP intake frame and a browser's ws:// connection are demuxed by
+# the first 4 bytes (AXIOM_DESIGN_TOT.md §3). No TLS: the UMP envelope
+# is already end-to-end sealed to the validator key (§4).
+listen = "0.0.0.0:7400"
+
+# The ONE validator inbox this TOT may write — its entire filesystem
+# reach, hardwired here at deploy time (AXIOM_DESIGN_TOT.md §3). The
+# systemd unit's ReadWritePaths= must point at this same path.
+maildir_inbox = "/var/lib/axiom/axiom-first-penguin-epsilon/maildir/inbox"
+
+# Intake rate limit: max TX submissions per connection per second.
+# 0 = unlimited (not recommended).
+intake_max_msgs_per_sec = 8
+
+# Hard cap on a single intake WebSocket message, in bytes.
+max_message_bytes = 262144
+
+# The attested Nabla node set. The webclient's /nabla leg selects a node
+# by 0-based index into THIS list (/nabla/<index>); an index outside the
+# list is refused. Keep this in sync with the validator's signed carrier
+# list, and mirror these addresses into the systemd unit's IPAddressAllow=.
+[[nabla]]
+name = "nabla-genesis-0"
+addr = "10.0.0.10:6000"
+
+[[nabla]]
+name = "nabla-genesis-1"
+addr = "10.0.0.11:6000"
+
+# DEV-ONLY (TOT built with `--features dev-fatmama`): the FATMAMA endpoints
+# the browser dev wallet reaches through the /fatmama/<index> tunnel. By
+# convention index 0 = SMTP (XAXIOM-REGISTER) and index 1 = POP3 (mail
+# pull). Ignored entirely by release builds (the /fatmama route is compiled
+# out). FATMAMA is dev-scoped (AXIOM_DESIGN_TOT.md §8) and exposes no
+# webhook — the browser reaches it ONLY through this tunnel. Mirror these
+# into the systemd unit's IPAddressAllow= when running the dev feature.
+# [[fatmama]]
+# name = "fatmama-smtp"
+# addr = "127.0.0.1:2525"
+# [[fatmama]]
+# name = "fatmama-pop3"
+# addr = "127.0.0.1:2527"

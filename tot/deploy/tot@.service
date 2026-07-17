@@ -1,0 +1,64 @@
+# AXIOM TOT — systemd template unit. One instance per validator:
+#   systemctl enable --now tot@<validator>.service
+# %i = the validator name. This unit IS sandbox layer 1 (the primary,
+# declarative layer). See docs/AXIOM_DESIGN_TOT.md §4.
+
+[Unit]
+Description=AXIOM TOT (Tiny Outbound Tunnel) — intake for validator %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tot /etc/tot/%i.toml
+Restart=on-failure
+RestartSec=2
+
+# ---- Sandbox layer 1: declarative confinement. ----------------------
+# Throwaway unprivileged user, no capabilities, no privilege gain.
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Filesystem: the whole tree is read-only EXCEPT the one validator
+# inbox. ReadWritePaths= MUST match maildir_inbox in /etc/tot/%i.toml.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/tot
+ReadWritePaths=/var/lib/axiom/%i/maildir/inbox
+
+# Network: deny all egress, then allow ONLY the attested Nabla nodes.
+# Operators MUST set IPAddressAllow= to the [[nabla]] addrs in %i.toml
+# (plus the loopback/host the WSS listener is bound to).
+IPAddressDeny=any
+# IPAddressAllow=10.0.0.10 10.0.0.11   <-- set per deployment
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Syscalls: a curated allowlist minus every dangerous group. Absolute
+# "no exec, ever" is enforced in-process by sandbox layer 2 (seccomp).
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @reboot @swap @module @obsolete
+SystemCallErrorNumber=EPERM
+
+# Misc hardening.
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,112 @@
+[package]
+name = "axiom-antie"
+version = "2.8.0"
+edition = "2021"
+license = "GPL-3.0"
+authors = ["AXIOM Project"]
+description = "AXIOM ANTIE Gateway - Email-based transaction gateway using Maildir"
+
+[[bin]]
+name = "antie"
+path = "src/main.rs"
+
+[lib]
+name = "axiom_antie"
+path = "src/lib.rs"
+
+[dependencies]
+# Core validation
+axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a" }
+# Structured error responses (AXIOM_YellowPaper_Errors.md Phase 2c.3).
+axiom-errors = { workspace = true, features = ["std"] }
+axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+# Shared per-IP TCP rate limiter (single source, also used by Lambda)
+axiom-rate-limit = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+# AVM interpreter for direct CL2 execution (no core-bin subprocess)
+axiom-dmap-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = true, features = ["riscv-interpreter"] }
+
+# Async runtime
+tokio = { version = "1.0", features = ["full", "fs"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# CRITICAL: use workspace ciborium (default-features = false) so antie's
+# encoding matches lambda/sdk/core. Pre-fix antie pulled std-enabled
+# ciborium, producing chains that decoded differently in the SDK's
+# update_fact_chain_confirmation path. See lambda/Cargo.toml comment.
+ciborium = { workspace = true }
+
+# Email parsing
+mail-parser = "0.9"
+mail-builder = "0.3"
+
+# Email transport (SMTP/IMAP/POP3)
+lettre = { version = "0.11", default-features = false, features = ["tokio1-native-tls", "smtp-transport", "builder"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+
+# WebSocket (for web wallet clients)
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+# File watching
+notify = "6.0"
+
+# Crypto
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+blake3 = "1.5"
+rand = "0.8"
+
+# Base64 encoding
+base64 = "0.22"
+
+# Hex encoding
+hex = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# Config
+toml = "0.8"
+
+# Colored output
+colored = "2.0"
+
+# UUID for message IDs
+uuid = { version = "1.0", features = ["v4"] }
+
+# PGP encryption for cheque payloads (YPX — cheque body encryption)
+sequoia-openpgp = { version = "2.1", default-features = false, features = ["crypto-openssl"] }
+# HTTP client for PGP keyserver lookups
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# TLS for Lambda TCP connection (opt-in for multi-host deployment)
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# Time
+chrono = "0.4"
+
+# Allocator — jemalloc returns memory to OS properly (glibc fragments)
+tikv-jemallocator = { version = "0.6", optional = true }
+
+# KI#23 mitigation — periodic `malloc_trim(0)` against glibc arena
+# retention. See `antie/src/malloc_trim.rs` for the rationale + the
+# 2026-06-01 measurement that motivated it.
+libc = "0.2"
+
+[features]
+disable-audit = ["axiom-dmap-vm/disable-audit"]
+cranelift-jit = ["axiom-dmap-vm/cranelift-jit-backend"]
+jemalloc = ["tikv-jemallocator"]
+
+[dev-dependencies]
+tempfile = "3.0"
+proptest = "1.4"
