@@ -26,11 +26,12 @@
 //! 8. Sends response email (via carrier)
 
 pub mod config;
+pub mod care_of;
 pub mod carrier;
 pub mod malloc_trim;
 pub mod maildir;
 pub mod email;
-pub mod cbor;
+pub mod custody;
 pub mod core_ipc;
 pub mod lambda_client;
 pub mod gateway;

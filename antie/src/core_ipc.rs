@@ -26,6 +26,12 @@ pub fn validate_transaction_cl2(
     vbc_bundle: Option<VBCProofBundle>,
     my_validator_pk: Option<Vec<u8>>,
     sender_fact_chain: Option<FactChain>,
+    // YP §26.17.6.5 B4 — the certificate set the CLIENT offered with the request.
+    // The gateway holds no store (that is Lambda's), so the prefilter judges the
+    // chain against exactly what was offered: a wallet that offers nothing for a
+    // chain with witnesses is refused here, before Lambda — fail-closed, and the
+    // same verdict Lambda's Core would reach on the offered set alone.
+    fact_certificates: Vec<VBCProofBundle>,
 ) -> Result<ValidationOutput, AntieError> {
     // CLAUDE.md §8 — ANTIE never synthesizes what Lambda should verify.
     //
@@ -44,14 +50,24 @@ pub fn validate_transaction_cl2(
     // can honestly perform from the request alone (signatures, dust, Ark
     // rules, oracle rules, genesis lockup, fact-chain integrity, burn
     // target, frozen wallets, version, reference length) and skips every
-    // state-DEPENDENT check (balance, wallet_seq chain, owner_proof
-    // against stored auth_hash, produced state hashes). Lambda's own CL2
+    // state-DEPENDENT check (balance, wallet_seq chain, produced state
+    // hashes). Lambda's own CL2
     // pass owns the authoritative checks against real stored state where
     // they belong.
     //
     // Reference: YPX-018 §2.1.2, CLAUDE.md §8 ("Layer roles are strict"),
     // `feedback_layer_roles.md` in project auto-memory.
     let inputs = PublicInputs {
+        zkq_request: None,
+        fact_certificates,
+        receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None,
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
+        fob_claim_attestation: None,
+        claimant_vbc: None,
+        receiver_witness: None,
+        receiver_signing_key: None,
         recall_attestation: None,
         mode: CoreLogicMode::CL2_PREFILTER,
         // YPX-021: the prefilter validates the TX shape only; no receipt is
@@ -62,7 +78,6 @@ pub fn validate_transaction_cl2(
         // skip). Authoritative check happens in Lambda's CL2 pass where
         // the validator's real ELF hash is plumbed via avm_config.
         local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
         receiver_current_hibernation: None,
         transaction: transaction.clone(),
         prev_receipts: prev_receipts.to_vec(),
@@ -92,10 +107,6 @@ pub fn validate_transaction_cl2(
             audit_response: None,
             wallet_secret: None,
             fanout_message: None,
-            scar_heal_tx_id: None,
-            scar_heal_nabla_id: None,
-            scar_heal_root_hash: None,
-            candidate_balance: None,
             nabla_stake_proof: None,
             frozen_wallets: None,
             console_current_cert: None,
@@ -129,6 +140,7 @@ pub fn validate_transaction_cl2(
                 new_wallet_seq: outputs.new_wallet_seq,
                 commitment_hash: outputs.commitment_hash,
                 rejection_reason: None,
+                rejection: None,
             })
         }
         ValidationResult::Fatal => {
@@ -143,6 +155,7 @@ pub fn validate_transaction_cl2(
             std::process::exit(78);
         }
         ValidationResult::Reject => {
+            let rejection = outputs.rejection_reason.clone();
             let reason = outputs.rejection_reason
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
@@ -157,6 +170,7 @@ pub fn validate_transaction_cl2(
                 new_wallet_seq: None,
                 commitment_hash: None,
                 rejection_reason: Some(reason),
+                rejection,
             })
         }
     }
@@ -175,6 +189,8 @@ pub struct ValidationOutput {
     pub new_wallet_seq: Option<u64>,
     pub commitment_hash: Option<[u8; 32]>,
     pub rejection_reason: Option<String>,
+    /// KI#157 — Core's typed verdict, so the reply can carry its structured code.
+    pub rejection: Option<axiom_core_logic::types::ValidationError>,
 }
 
 /// CL10 Fan-Out verification — verify a Fan-Out message before relaying.
@@ -187,11 +203,20 @@ pub fn verify_fanout_cl10(
     vbc_bundle: Option<VBCProofBundle>,
 ) -> Result<FanOutVerifyResult, AntieError> {
     let inputs = PublicInputs {
+        zkq_request: None,
+        fact_certificates: Vec::new(),
+        receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None,
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
+        fob_claim_attestation: None,
+        claimant_vbc: None,
+        receiver_witness: None,
+        receiver_signing_key: None,
         recall_attestation: None,
         mode: CoreLogicMode::CL10,
         oods_attestation: None,
         local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
         receiver_current_hibernation: None,
         // CL10 doesn't use the transaction; pass an explicit default rather
         // than parsing a JSON string literal at runtime (no JSON on the
@@ -224,10 +249,6 @@ pub fn verify_fanout_cl10(
         audit_response: None,
         wallet_secret: None,
         fanout_message: Some(fanout_message.clone()),
-        scar_heal_tx_id: None,
-        scar_heal_nabla_id: None,
-        scar_heal_root_hash: None,
-        candidate_balance: None,
         nabla_stake_proof: None,
         frozen_wallets: None,
         console_current_cert: None,
@@ -255,9 +276,11 @@ pub fn verify_fanout_cl10(
                 accepted: true,
                 new_ttl,
                 rejection_reason: None,
+                rejection: None,
             })
         }
         ValidationResult::Reject => {
+            let rejection = outputs.rejection_reason.clone();
             let reason = outputs.rejection_reason
                 .map(|r| format!("{}", r))
                 .unwrap_or_else(|| "Unknown".into());
@@ -266,6 +289,7 @@ pub fn verify_fanout_cl10(
                 accepted: false,
                 new_ttl: 0,
                 rejection_reason: Some(reason),
+                rejection,
             })
         }
         ValidationResult::Fatal => {
@@ -274,6 +298,7 @@ pub fn verify_fanout_cl10(
                 accepted: false,
                 new_ttl: 0,
                 rejection_reason: Some("Fatal error in CL10".into()),
+                rejection: None,
             })
         }
     }
@@ -285,4 +310,6 @@ pub struct FanOutVerifyResult {
     pub accepted: bool,
     pub new_ttl: u8,
     pub rejection_reason: Option<String>,
+    /// KI#157 — Core's typed verdict, so the reply can carry its structured code.
+    pub rejection: Option<axiom_core_logic::types::ValidationError>,
 }

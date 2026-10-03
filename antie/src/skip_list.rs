@@ -6,9 +6,11 @@
 //! - Load `<skip_list_path>` (plain text, one `receiver_wallet_id`
 //!   per line; lines starting with `#` are comments; blank lines
 //!   ignored) into an in-memory `HashSet<String>`.
-//! - Watch for SIGHUP (reload from disk) and atomic-rename of the
-//!   skip-list file (sibling carriers pick whichever mechanism they
-//!   prefer; ANTIE supports both).
+//! - Reload from disk on SIGHUP. (The design doc also promised an
+//!   fs-watch on the file; that was never built — SIGHUP is the ONLY
+//!   reload trigger. A sibling carrier that renames without signalling
+//!   is not picked up; see axiom-uncle/src/acl.rs which SIGHUPs after
+//!   its atomic rename for exactly this reason.)
 //! - On every outbound cheque dispatch, the gateway calls
 //!   [`SkipList::contains`] before sendmail. If listed, the cheque
 //!   bytes go to `<skipped_dir_path>/<filename>` via atomic
@@ -202,8 +204,17 @@ impl SkipList {
 ///
 /// The handler swallows errors (logged) so a temporarily-unreadable
 /// skip-list file (e.g. mid-write by a sibling carrier) doesn't kill
-/// ANTIE. The set survives in its previous state until the next
-/// successful reload.
+/// ANTIE.
+///
+/// ⚠ A failed read does NOT preserve the previous set — `load()` returns
+/// an empty set on read failure and `reload()` swaps it in unconditionally,
+/// so the divert is silently DISABLED (cheques go to email) until the next
+/// successful reload. An earlier version of this comment claimed the set
+/// survived; it never did. Sibling carriers using atomic rename make the
+/// unreadable window near-zero, which is why this is tolerated rather
+/// than fixed with a keep-previous branch (a stale keep-previous set has
+/// its own failure mode: diverting for a receiver a carrier already
+/// dropped).
 pub fn install_sighup_handler(skip_list: Arc<SkipList>) {
     tokio::spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};

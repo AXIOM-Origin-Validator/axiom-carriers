@@ -84,6 +84,10 @@ impl From<&AntieError> for ErrorResponse {
                 ErrorCategory::ProtocolReject,
                 s.clone(),
             ),
+            // Lambda's own verdict — return it UNCHANGED. Re-coding it under an
+            // ANTIE error code would re-introduce the flattening this variant
+            // exists to prevent (ANTIE forwards, never reinterprets).
+            AntieError::LambdaRejected(er) => return er.clone(),
         };
         ErrorResponse::new(ErrorCode::from_static(code), category, message)
     }

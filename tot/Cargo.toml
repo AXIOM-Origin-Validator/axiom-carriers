@@ -18,7 +18,7 @@ path = "src/main.rs"
 # AXC/L$/atom conversion + 乖乖 boot-canary const (denomination/src/lib.rs).
 # Every native binary in the workspace depends on this crate; if a binary
 # starts without the art it means the consolidation regressed.
-axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.7.1" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

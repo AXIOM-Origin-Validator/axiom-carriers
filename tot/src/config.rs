@@ -25,6 +25,28 @@ pub struct Config {
     /// The attested Nabla node set. The /nabla leg selects a node by
     /// 0-based index into this list; any other destination is refused.
     pub nabla: Vec<NablaNode>,
+
+    /// Where ANTIE deposits replies for `/session` clients (YPX-023 RULE 3,
+    /// AXIOM_DESIGN_TOT.md §5.4). TOT's SECOND filesystem reach, and its only
+    /// writable one besides the maildir inbox.
+    ///
+    /// ⚠ MUST be byte-identical to the `outbox` on ANTIE's matching
+    /// `[[custody.route]]` row. The two are wired from one value by
+    /// `scripts/axiom-env.py`; configured by hand they silently never meet —
+    /// ANTIE deposits replies nobody collects and every session hangs, with
+    /// nothing in either log saying why. Same failure mode, and same fix, as
+    /// UNCLE's `witness_outbox` (see `UncleSinkConfig::outbox_path`).
+    ///
+    /// `None` (the default) disables the `/session` route entirely: TOT will
+    /// refuse the route rather than mint a session it cannot deliver to.
+    /// Absence must never mean "try anyway".
+    ///
+    /// Each session owns `<custody_outbox>/<session_id>/`, which is how TOT
+    /// knows WHICH CLIENT a reply belongs to without parsing it: the task that
+    /// minted the id also holds the socket, so it watches only its own
+    /// directory. No registry, no correlation table.
+    #[serde(default)]
+    pub custody_outbox: Option<PathBuf>,
     /// DEV-ONLY (`dev-fatmama` feature): the FATMAMA endpoint set the
     /// `/fatmama/<n>` tunnel is bounded to — typically the dev SMTP port
     /// (XAXIOM-REGISTER) at index 0 and the POP3 port (mail pull) at index

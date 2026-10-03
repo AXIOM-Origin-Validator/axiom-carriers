@@ -14,6 +14,18 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 /// Parsed AXIOM email
+/// Custody header names ANTIE recognises (YPX-023 §3.3).
+///
+/// Recognising a name here only means "record it so the reply can be routed";
+/// whether a row EXISTS for it is the config's business, and an unconfigured
+/// name simply takes the ordinary mail path. Adding a path is a config row —
+/// this list exists so a typo'd header is not silently treated as custody.
+///
+/// ⚠ `X-UNCLE-Correlate` is deliberately NOT here: it has its own field and
+/// its own tee semantics (a COPY, mail still sent). Folding it in is YPX-023
+/// §3.4 — decided, deferred, and it changes no wire bytes.
+pub const CUSTODY_HEADERS: &[&str] = &["X-TOT-Session"];
+
 #[derive(Debug, Clone)]
 pub struct AntieEmail {
     /// Sender address
@@ -38,7 +50,16 @@ pub struct AntieEmail {
     pub raw: Vec<u8>,
 
     /// Optional UNCLE correlation id, extracted from the
-    /// `X-UNCLE-Correlate` header if present. UNCLE's SubmitSend
+    /// `X-UNCLE-Correlate` header if present.
+    ///
+    /// ⚠ **MIGRATION DECIDED 2026-08-24 (AXIOM Origin), code deferred:** this
+    /// header folds into the unified `X-Custody: hop=uncle; class=…; id=…`
+    /// stamp (`X-Custody: uncle; id=…`) — YPX-023 §3.4. Same 32-byte id, same
+    /// strict 64-hex parse, so the
+    /// value carries over unchanged. **Do not migrate ANTIE alone:** UNCLE
+    /// stamps this header from `axiom-uncle::handlers::submit_send` in another
+    /// repo, and changing only the parser makes the tee go silently quiet.
+    /// Both sides land in one commit, together with `X-Custody` itself. UNCLE's SubmitSend
     /// handler stamps this header before dropping the UMP into the
     /// validator maildir; ANTIE preserves it as opaque 32 bytes and
     /// forwards it to `uncle_sink::tee` so the response file lands at
@@ -48,6 +69,19 @@ pub struct AntieEmail {
     /// `None` on any non-UNCLE-mediated email — the normal SMTP/maildir
     /// dispatch path is unchanged for those.
     pub uncle_correlate: Option<[u8; 32]>,
+
+    /// Custody header this message arrived with, as `(header_name, id)` —
+    /// YPX-023 §3.3. Set when the inbound envelope carried one of the custody
+    /// headers ANTIE is configured to route on (e.g. `X-TOT-Session`), stamped
+    /// by the carrier that owns the client's connection.
+    ///
+    /// `None` on every ordinary path, which is what keeps this additive: no
+    /// header ⇒ ANTIE behaves exactly as before.
+    ///
+    /// The name is kept VERBATIM (not normalised to an enum) because the
+    /// routing table matches on it and the vocabulary is deliberately open —
+    /// a new path is a config row, not a code change.
+    pub custody: Option<(String, String)>,
 }
 
 /// AXIOM message payload
@@ -83,17 +117,22 @@ pub struct AntiePayload {
     // CBOR→JSON→struct conversion in `decode_payload_inner` — exactly the
     // mirror-struct drift pattern catalogued in CLAUDE.md §12.
     //
-    // [[feedback_no_json_in_protocol_path]]: removing them eliminates ~30
-    // `serde_json::Value` fields from the protocol path. The remaining
-    // `Option<serde_json::Value>` fields below (`query_params`,
-    // `group_members`, `audit_confirmation`, etc) are STILL ACTIVELY READ
-    // by gateway for the non-typed flows (queries, group setup, peer audit,
-    // scar healing, fanout). Migrating those to raw CBOR bytes is the next
-    // sweep.
+    // [[feedback_no_json_in_protocol_path]]: removing them eliminated ~30
+    // `serde_json::Value` fields from the protocol path.
+    //
+    // KI#242 (2026-10-02): the LAST `serde_json::Value` fields (`query_params`,
+    // `group_members`, `peer_audit_request/_response/_not_held`, `fanout_message`)
+    // are gone too. This struct is now decoded STRAIGHT from the CBOR body with
+    // `ciborium` (`decode_payload_inner`) — no JSON intermediate — and the
+    // peer-audit fields are the Core types themselves, so a field Core adds to
+    // them is carried, not dropped.
 
-    /// Query parameters (for query handlers — typed-wire migration pending)
+    /// Query parameters (for the `query` handler). The only reader is
+    /// `gateway.rs::handle_query`, which takes `wallet_pk` (bytes) out of the map.
+    /// A CBOR value, not a Core type: no Core type owns this shape (the reply side
+    /// is KI#179's deliberate privacy projection).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub query_params: Option<serde_json::Value>,
+    pub query_params: Option<ciborium::Value>,
 
     // === Genesis dev fields ===
 
@@ -107,7 +146,7 @@ pub struct AntiePayload {
 
     /// Group wallet members for genesis (init_genesis_dev)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group_members: Option<Vec<serde_json::Value>>,
+    pub group_members: Option<Vec<axiom_core_logic::types::GroupMember>>,
 
     // === ACK fields ===
     
@@ -144,7 +183,7 @@ pub struct AntiePayload {
     pub ed25519_pk_hex: Option<String>,
     
     /// PGP fingerprint hex (for VBC sign requests, optional)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pgp_fingerprint_hex: Option<String>,
     
     /// Issued timestamp (for VBC sign commit)
@@ -160,18 +199,8 @@ pub struct AntiePayload {
     pub chain_depth: Option<u8>,
     
     /// Issuer set hex (for VBC sign commit)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issuer_set_hex: Vec<String>,
-
-    // === Scar healing fields (YPX-001 §1.5.3) ===
-
-    /// Scar recovery proof (for scar_heal requests)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scar_recovery_proof: Option<serde_json::Value>,
-
-    /// Target wallet ID for scar heal application
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_wallet_id: Option<String>,
 
     // === Phase 3C: Onboarding fields (carrier passthrough) ===
 
@@ -183,10 +212,11 @@ pub struct AntiePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_name_field: Option<String>,
 
-    // === §4.5: auth_hash (stolen-key protection) ===
+    // === §4.5: auth_hash (NOT stolen-key protection — see KI#108) ===
 
-    /// Ed25519 pubkey derived from owner_secret — 32 bytes (v2.11.13).
-    /// Once set on a wallet, every TX requires owner_proof (Ed25519 signature).
+    /// Ed25519 pubkey derived from the wallet private key — 32 bytes (v2.11.13).
+    /// Stored by Lambda into `WalletState.auth_hash`; read by nothing in Core
+    /// since `owner_proof` was deleted 2026-09-25 (KI#108).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_hash: Option<Vec<u8>>,
 
@@ -195,22 +225,115 @@ pub struct AntiePayload {
     /// Peer audit request (inbound from remote validator).
     /// Contains txid + expected_hash. Lambda looks up DB, Core verifies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_audit_request: Option<serde_json::Value>,
+    pub peer_audit_request: Option<axiom_core_logic::types::PeerAuditRequest>,
 
     /// Peer audit response (inbound from remote validator).
     /// Contains computed_hash from remote Core's verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_audit_response: Option<serde_json::Value>,
+    pub peer_audit_response: Option<axiom_core_logic::types::PeerAuditResponse>,
 
-    // === §18.8: Fan-Out Protocol ===
-
-    /// Fan-Out message for relay (CL10 verified).
-    /// Contains: diffusion_id, content_type, content, originator_pk/sig, TTL.
+    /// §23.14.6 (KI#213): the audited validator's SIGNED "I hold no record for
+    /// that txid" — travels under the `peer_audit_response` message type in
+    /// place of `peer_audit_response`, so A's audit handler sees an ANSWER, not
+    /// silence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fanout_message: Option<serde_json::Value>,
+    pub peer_audit_not_held: Option<axiom_core_logic::types::PeerAuditNotHeld>,
+
+    // `fanout_message` DELETED 2026-10-02 (KI#242): it was never read — an
+    // inbound `fanout_relay` is refused at the door by MESSAGE TYPE
+    // (`gateway.rs::handle_fanout_relay`, KI#175), not by this field. A body
+    // still carrying the key decodes (unknown keys are ignored).
 }
 
 /// Parse an email from raw bytes (no decryption — for tests / legacy callers).
+/// Cheap, marker-free anti-spam heuristic for pull carriers (POP3/IMAP).
+///
+/// Shannon byte-entropy of the message BODY (the region after the header/body
+/// separator), in bits/byte. A genuine UMP body is base64-encoded cryptographic
+/// CBOR (Dilithium sigs, hashes, keys — and, for COUSIN cover traffic,
+/// encrypted + random-padded), so it is HIGH, near-uniform entropy (~5.5–6).
+/// Ordinary spam — welcome mail, newsletters, marketing — is natural-language
+/// text/HTML: LOW, skewed entropy (~4–4.5). The caller deletes bodies BELOW a
+/// configured threshold (recommended ~4.5, conservative).
+///
+/// Deliberately keys ONLY on what spam intrinsically lacks — randomness — never
+/// on an added marker/magic (which would let a censor fingerprint AXIOM, the
+/// opposite of the cover-traffic goal) and never on the subject (which will be
+/// randomized for GFW padding). This is the FLOOR of hygiene, not a spam engine
+/// (that is the MTA's job) and NOT a trust boundary (Core validates
+/// authenticity). Bias is toward KEEP: a false-keep just parse-drops downstream;
+/// a false-delete would lose a transaction — so short bodies return max entropy.
+pub fn body_entropy_bits(raw_email: &[u8]) -> f32 {
+    let body: &[u8] = raw_email
+        .windows(4).position(|w| w == b"\r\n\r\n").map(|i| &raw_email[i + 4..])
+        .or_else(|| raw_email.windows(2).position(|w| w == b"\n\n").map(|i| &raw_email[i + 2..]))
+        .unwrap_or(raw_email);
+    if body.len() < 64 {
+        return 8.0; // too little to judge → KEEP
+    }
+    let mut hist = [0u32; 256];
+    for &b in body { hist[b as usize] += 1; }
+    let n = body.len() as f32;
+    let mut h = 0.0f32;
+    for &c in hist.iter() {
+        if c > 0 {
+            let p = c as f32 / n;
+            h -= p * p.log2();
+        }
+    }
+    h
+}
+
+#[cfg(test)]
+mod entropy_spam_filter_tests {
+    use super::body_entropy_bits;
+
+    // A tiny xorshift so the "crypto-like" body is deterministic but flat.
+    fn base64ish_random(len: usize) -> Vec<u8> {
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            out.push(ALPHABET[(x % 64) as usize]);
+        }
+        out
+    }
+
+    #[test]
+    fn text_spam_low_entropy_umd_high_entropy() {
+        // Natural-language newsletter/welcome spam.
+        let spam = b"From: promo@shop.example\r\nSubject: hi\r\n\r\n\
+            Hello and welcome to our newsletter! We are so excited to have you with \
+            us today. Click here for amazing deals on shoes, hats and much more. You \
+            can unsubscribe at any time. Best regards, the marketing team. Visit our \
+            website for the very latest offers and save big this week only!";
+        let e_spam = body_entropy_bits(spam);
+
+        // A real UMP shape: base64 of high-entropy crypto bytes.
+        let mut umd = b"Subject: whatever\r\n\r\n".to_vec();
+        umd.extend_from_slice(&base64ish_random(2000));
+        let e_umd = body_entropy_bits(&umd);
+
+        assert!(e_spam < 4.5, "natural text should be low entropy, got {e_spam}");
+        assert!(e_umd > 5.0, "base64 crypto body should be high entropy, got {e_umd}");
+        assert!(e_umd > e_spam + 1.0,
+                "UMP ({e_umd}) must be clearly higher entropy than spam ({e_spam})");
+
+        // The recommended ~4.5 threshold separates them.
+        let thr = 4.5f32;
+        assert!(e_spam < thr && e_umd >= thr,
+                "threshold {thr} must drop spam ({e_spam}) and keep UMP ({e_umd})");
+    }
+
+    #[test]
+    fn short_body_is_kept() {
+        // Too little to judge -> max entropy -> never dropped.
+        assert_eq!(body_entropy_bits(b"Subject: x\r\n\r\nhi"), 8.0);
+    }
+}
+
 pub fn parse_email(raw: &[u8]) -> Result<AntieEmail, AntieError> {
     parse_email_with_context(raw, None)
 }
@@ -312,6 +435,20 @@ pub fn parse_email_outcome(
             <[u8; 32]>::try_from(bytes.as_slice()).ok()
         });
 
+    // Custody header (YPX-023 §3.3). ANTIE does not know what the names mean;
+    // it records which one arrived so the reply can be routed by the table.
+    // The id parse is deliberately the same strict rule as X-UNCLE-Correlate's
+    // (exactly 64 hex) — an id names where a signed reply is deposited, so a
+    // sloppy parse is a misdelivery.
+    let custody = CUSTODY_HEADERS.iter().find_map(|name| {
+        let raw = message.header_raw(*name)?;
+        let id = raw.trim();
+        if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(((*name).to_string(), id.to_ascii_lowercase()))
+    });
+
     // Parse subject: AXIOM/<type>/<request_id>
     let subject = message.subject().unwrap_or("");
     let (message_type, request_id) = parse_subject(subject)?;
@@ -336,6 +473,7 @@ pub fn parse_email_outcome(
         payload,
         raw: raw.to_vec(),
         uncle_correlate,
+        custody,
     })))
 }
 
@@ -493,21 +631,35 @@ fn unwrap_by_format(
     }
 }
 
-/// Inner CBOR→AntiePayload parser (the post-envelope-unwrap path).
-fn decode_payload_inner(decoded: &[u8]) -> Result<AntiePayload, AntieError> {
-    // Decode CBOR into ciborium::Value first, then convert to AntiePayload.
-    // For prev_receipts and overlapped_signatures, we store raw CBOR bytes
-    // in the _raw fields so the gateway can deserialize them directly
-    // (preserving CBOR Bytes type for VBC bundles). The serde_json::Value
-    // fields remain for backward compat with the TCP/WS path.
-    let cbor_val: ciborium::Value = ciborium::from_reader(decoded)
-        .map_err(|e| AntieError::EmailParseError(format!("CBOR decode failed: {}", e)))?;
+/// Nesting limit for the inbound body decode — the number of nested CBOR
+/// arrays/maps `ciborium` will enter (the top-level map counts). 33 is the
+/// smallest limit that refuses NO body the former hand decoder accepted: that
+/// decoder capped ITEM depth at 32 (`MAX_CBOR_DEPTH`), so 33 container levels
+/// passed when the innermost was empty. It is one level more permissive when
+/// the innermost container is non-empty (old: refused at 32 nested + a scalar;
+/// new: accepted) — no limit matches both exactly, because the old cap counted
+/// scalars and ciborium counts containers. Pinned (MEASURED, all depths 1..=40)
+/// by `ki242_tests::depth_limit_never_refuses_what_the_old_decoder_took`.
+const BODY_RECURSION_LIMIT: usize = 33;
 
-    // Convert to JSON for the AntiePayload struct (legacy path)
-    let json_value = crate::cbor::cbor_to_json(decoded)
-        .map_err(|e| AntieError::EmailParseError(format!("CBOR→JSON failed: {}", e)))?;
-    let mut payload: AntiePayload = serde_json::from_value(json_value)
-        .map_err(|e| AntieError::EmailParseError(format!("JSON→struct failed: {}", e)))?;
+/// Inner CBOR→AntiePayload parser (the post-envelope-unwrap path).
+///
+/// ⚠ KI#242 (RULE 0 §4, 2026-10-02) — the WRONG reading this replaced: the body
+/// was decoded twice — once by `ciborium` into a `Value` that was then DISCARDED
+/// (`let _ = cbor_val;`), and again by a hand decoder (`cbor.rs::cbor_to_json`)
+/// into `serde_json::Value` → `serde_json::from_value::<AntiePayload>`. That was
+/// a second codec in the protocol path: integer map keys stringified (`1` ≡
+/// `"1"`), negative integers wrapping past i64, f16/f32/tags/indefinite lengths
+/// refusing the WHOLE mail, and `Value` fields that silently dropped any field a
+/// Core type added. The correct reading: the body IS CBOR of this struct, so it
+/// is decoded ONCE, typed, with `ciborium` (the codec every other UMP reader
+/// uses). Behaviour change, deliberate: a malformed `peer_audit_*` /
+/// `group_members` now fails the whole decode (`EmailParseError`) instead of an
+/// `InvalidPayload` inside the handler — refused either way.
+fn decode_payload_inner(decoded: &[u8]) -> Result<AntiePayload, AntieError> {
+    let mut payload: AntiePayload =
+        ciborium::de::from_reader_with_recursion_limit(decoded, BODY_RECURSION_LIMIT)
+            .map_err(|e| AntieError::EmailParseError(format!("CBOR decode failed: {}", e)))?;
 
     // UMP enforcement — `axiom_core_logic::types` owns the canonical
     // typed wires (`WitnessRequest`, `RedeemRequestEnvelope`, …). The
@@ -517,13 +669,6 @@ fn decode_payload_inner(decoded: &[u8]) -> Result<AntiePayload, AntieError> {
     // a typed-wire field is the drift pattern this layer was rebuilt
     // to delete — see `scripts/check_layer_boundary.sh` Rule 9 and
     // `feedback_no_mirror_structs`.
-    //
-    // `cbor_val` is intentionally unused here now; the typed
-    // deserialize at the consumer side replaces every former per-field
-    // extraction arm (`prev_receipts`, `overlapped_signatures`,
-    // `sender_fact_chain`, `receiver_fact_chain`, `fact_witness_sigs`,
-    // `fee_breakdown`, `cheque_claim_proof`, `cl1_execution_proof`).
-    let _ = cbor_val;
     payload.raw_ump_body = decoded.to_vec();
 
     Ok(payload)
@@ -569,7 +714,13 @@ pub fn build_response(
     // json_to_cbor heuristic → CBOR Bytes usually works, but edge cases
     // (empty vecs, nested structure confusion) produced CBOR Array instead
     // of Bytes, causing verify_dilithium to fail on deserialization.
-    // Direct ciborium serialization preserves Vec<u8> as CBOR Bytes always.
+    // ⚠ RULE 0 §4 (KI#242, MEASURED 2026-10-02): the claim that stood here —
+    // "direct ciborium serialization preserves Vec<u8> as CBOR Bytes always" —
+    // is FALSE: serde gives `Vec<u8>` no bytes hint, so ciborium writes a CBOR
+    // ARRAY (`ki242_tests::ciborium_writes_vec_u8_as_an_array`). What fixed the
+    // FactWitness sigs is that the bytes are now written and read by ONE codec
+    // (ciborium; its `deserialize_seq` accepts a byte string or an array), not
+    // a heuristic second codec.
     let mut cbor_bytes = Vec::new();
     ciborium::into_writer(payload, &mut cbor_bytes)
         .map_err(|e| AntieError::SerializationError(format!("CBOR encode: {}", e)))?;
@@ -606,45 +757,6 @@ pub fn build_response(
     Ok(email.into_bytes())
 }
 
-/// Build a scar healing notification email (YPX-001 §1.5.3)
-///
-/// Sent to downstream receivers when a sender's FACT link scar is healed.
-/// Subject: AXIOM/scar_heal/<uuid>
-/// Body: CBOR-encoded payload with scar_recovery_proof and target_wallet_id
-pub fn build_scar_heal_email(
-    from: &str,
-    to: &str,
-    proof: &serde_json::Value,
-    target_wallet_id: &str,
-) -> Result<Vec<u8>, AntieError> {
-    let payload = serde_json::json!({
-        "scar_recovery_proof": proof,
-        "target_wallet_id": target_wallet_id,
-    });
-
-    let cbor_bytes = crate::cbor::json_to_cbor(&payload);
-    let encoded = BASE64.encode(&cbor_bytes);
-
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let msg_id = format!("<{}.{}@axiom>",
-        uuid::Uuid::new_v4(),
-        chrono::Utc::now().timestamp()
-    );
-
-    let mut email = String::new();
-    email.push_str(&format!("From: {}\r\n", sanitize_header(from)));
-    email.push_str(&format!("To: {}\r\n", sanitize_header(to)));
-    email.push_str(&format!("Subject: AXIOM/scar_heal/{}\r\n", request_id));
-    email.push_str(&format!("Message-ID: {}\r\n", msg_id));
-    email.push_str(&format!("Date: {}\r\n", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S +0000")));
-    email.push_str("Content-Type: text/plain; charset=utf-8\r\n");
-    email.push_str("\r\n");
-    email.push_str(&encoded);
-    email.push_str("\r\n");
-
-    Ok(email.into_bytes())
-}
-
 /// Build a cheque delivery email (§17.9)
 ///
 /// Sent from validator to receiver after successful witness.
@@ -652,13 +764,34 @@ pub fn build_scar_heal_email(
 /// Receiver collects k cheques, bundles them, submits for redemption (CL5).
 ///
 /// Subject: AXIOM/cheque/<uuid>
-/// Body: CBOR-encoded ValidatorCheque + optional sender FACT chain
+/// Body: CBOR-encoded ValidatorCheque + optional sender FACT chain + the
+/// cheque's `send_origin` (KI#241 F-2).
+///
+/// `send_origin` — the witnessed send's ORIGIN RECORD (`WitnessPreimage` +
+/// epoch, kind `Send`), built by Core's ONE constructor
+/// `nabla_wire::LegPreimage::origin_of(&tx)` from the transaction this
+/// validator just witnessed. The receiver never otherwise learns the sender's
+/// `client_pk` / `wallet_seq` / `nonce`; it verifies this record against the
+/// k-signed cheque (`axiom_sdk_core::recv`, five equalities) and carries it on
+/// its redeem leg (`LegPreimage::Redeem { cheque }`), which is how Nabla's
+/// provenance burn exit learns the cheque's GROSS amount when the sender never
+/// registered (Fable review 2026-10-01). A DELIVERY field between ANTIE and
+/// the SDK — no Core input, CoreID-neutral (precedent: `VbcDelivery`).
+/// REFUSED here (never shipped) unless it reproduces `cheque.txid`.
 pub fn build_cheque_delivery_email(
     from: &str,
     to: &str,
     cheque: &axiom_core_logic::types::ValidatorCheque,
     sender_fact_chain: Option<&axiom_core_logic::types::FactChain>,
+    send_origin: &axiom_core_logic::types::OriginRecord,
 ) -> Result<Vec<u8>, AntieError> {
+    if !axiom_core_logic::nabla_wire::cheque_origin_matches(send_origin, &cheque.txid) {
+        return Err(AntieError::InvalidPayload(format!(
+            "cheque {}: send_origin does not reproduce the cheque txid — refusing to deliver a cheque \
+             the receiver would reject (KI#241 F-2)",
+            hex::encode(&cheque.txid[..4]),
+        )));
+    }
     // Serialize cheque delivery directly to CBOR (same fix as build_response).
     // The JSON→CBOR path corrupts Dilithium signatures in sender_fact_chain.
     #[derive(serde::Serialize)]
@@ -666,10 +799,14 @@ pub fn build_cheque_delivery_email(
         cheque: &'a axiom_core_logic::types::ValidatorCheque,
         #[serde(skip_serializing_if = "Option::is_none")]
         cheque_fact_chain: Option<&'a axiom_core_logic::types::FactChain>,
+        /// KI#241 F-2 — mandatory, LAST (see the fn doc). Reuses Core's
+        /// `OriginRecord` shape (no mirror struct).
+        send_origin: &'a axiom_core_logic::types::OriginRecord,
     }
     let payload = ChequePayload {
         cheque,
         cheque_fact_chain: sender_fact_chain,
+        send_origin,
     };
     let mut cbor_bytes = Vec::new();
     ciborium::into_writer(&payload, &mut cbor_bytes)
@@ -705,6 +842,55 @@ pub fn build_cheque_delivery_email(
 ///
 /// Subject: AXIOM/scar_consent/<uuid>
 /// Body: base64(CBOR { scar_consent: ScarConsentNotification })
+/// §5.2.2f — THE CERTIFICATE IS A DELIVERY. Body = base64(CBOR `VbcDelivery`);
+/// the subject is NOT part of the contract (it may be padded or randomised
+/// against fingerprinting — the owner, 2026-09-09); receivers recognise the BODY.
+/// Twin of `axiom_sdk::validator_join::VbcDelivery` (the SDK reads what this
+/// writes; kept out of core/logic on purpose — no Core change, no rotation).
+pub const VBC_DELIVERY_MAGIC: &str = "AXIOM-VBC-SIG/1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct VbcDelivery {
+    pub magic: String,
+    pub signature: axiom_core_logic::types::VbcIssuerSignature,
+}
+
+pub fn build_vbc_delivery_email(
+    from: &str,
+    to: &str,
+    signature: &axiom_core_logic::types::VbcIssuerSignature,
+) -> Result<Vec<u8>, AntieError> {
+    let payload = VbcDelivery { magic: VBC_DELIVERY_MAGIC.into(), signature: signature.clone() };
+    let mut cbor_bytes = Vec::new();
+    ciborium::into_writer(&payload, &mut cbor_bytes)
+        .map_err(|e| AntieError::SerializationError(format!("vbc delivery CBOR: {}", e)))?;
+    let encoded = BASE64.encode(&cbor_bytes);
+    let msg_id = format!("<{}.{}@axiom>", uuid::Uuid::new_v4(), chrono::Utc::now().timestamp());
+    let mut email = String::new();
+    email.push_str(&format!("From: {}\r\n", sanitize_header(from)));
+    email.push_str(&format!("To: {}\r\n", sanitize_header(to)));
+    // Free-form on purpose: nothing may key on it.
+    email.push_str(&format!("Subject: AXIOM/vbc/{}\r\n", uuid::Uuid::new_v4()));
+    email.push_str(&format!("Message-ID: {}\r\n", msg_id));
+    email.push_str(&format!("Date: {}\r\n", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S +0000")));
+    email.push_str("Content-Type: text/plain; charset=utf-8\r\n\r\n");
+    email.push_str(&encoded);
+    email.push_str("\r\n");
+    Ok(email.into_bytes())
+}
+
+/// Body-shape recogniser: `Some` iff the message body decodes as a
+/// `VbcDelivery` with the right magic. Cheap on everything else (base64 or
+/// CBOR fails first). Subject and headers are ignored entirely.
+pub fn try_parse_vbc_delivery(raw: &[u8]) -> Option<axiom_core_logic::types::VbcIssuerSignature> {
+    let msg = MessageParser::default().parse(raw)?;
+    let body = msg.body_text(0)?;
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = BASE64.decode(compact.as_bytes()).ok()?;
+    let d: VbcDelivery = ciborium::from_reader(bytes.as_slice()).ok()?;
+    (d.magic == VBC_DELIVERY_MAGIC).then_some(d.signature)
+}
+
 pub fn build_scar_consent_email(
     from: &str,
     to: &str,
@@ -742,6 +928,25 @@ pub fn build_scar_consent_email(
     Ok(email.into_bytes())
 }
 
+/// §23.14.6 peer-audit mail body: CBOR of `AntiePayload` with exactly one
+/// `peer_audit_*` field set — the SAME struct the receiving ANTIE decodes it as
+/// (`decode_payload_inner`), so writer and reader cannot drift.
+///
+/// ⚠ KI#242 (2026-10-02): this was `serde_json::json!` → `cbor::json_to_cbor`,
+/// whose "every element ≤ 255 ⇒ byte string" heuristic retyped arrays and whose
+/// map keys came out sorted. The bytes now differ from the old ANTIE's (field
+/// order = struct order; `[u8; 32]` / `Vec<u8>` as CBOR arrays, as `ciborium`
+/// writes every other UMP) but DECODE to the same Core value in both the old and
+/// the new ANTIE — measured in `ki242_tests::mixed_roll_*`. Nothing signs the mail
+/// bytes: the request/response signatures cover field-derived payloads
+/// (`audit::peer_audit_*_signing_payload`).
+fn peer_audit_body_cbor(payload: &AntiePayload) -> Result<Vec<u8>, AntieError> {
+    let mut cbor_bytes = Vec::new();
+    ciborium::into_writer(payload, &mut cbor_bytes)
+        .map_err(|e| AntieError::SerializationError(format!("CBOR encode: {}", e)))?;
+    Ok(cbor_bytes)
+}
+
 /// Build a peer audit request email (§23.14.6)
 ///
 /// Sent to target validator when Core demands a peer audit.
@@ -752,12 +957,8 @@ pub fn build_peer_audit_request_email(
     to: &str,
     request: &axiom_core_logic::types::PeerAuditRequest,
 ) -> Result<Vec<u8>, AntieError> {
-    let payload = serde_json::json!({
-        "peer_audit_request": serde_json::to_value(request)?,
-    });
-
-    let cbor_bytes = crate::cbor::json_to_cbor(&payload);
-    let encoded = BASE64.encode(&cbor_bytes);
+    let payload = AntiePayload { peer_audit_request: Some(request.clone()), ..Default::default() };
+    let encoded = BASE64.encode(&peer_audit_body_cbor(&payload)?);
 
     let request_id = uuid::Uuid::new_v4().to_string();
     let msg_id = format!("<{}.{}@axiom>",
@@ -781,20 +982,17 @@ pub fn build_peer_audit_request_email(
 
 /// Build a peer audit response email (§23.14.6)
 ///
-/// Sent back from target validator after verifying the audit request.
+/// Sent back from target validator after authenticating the audit request.
 /// Subject: AXIOM/peer_audit_response/<uuid>
-/// Body: CBOR-encoded PeerAuditResponse (txid + computed_hash + challenge_nonce + responder_pk)
+/// Body: CBOR-encoded PeerAuditResponse (txid + nonce + raw DB fields +
+/// responder_pk + responder_sig — KI#207 raw-fields, KI#175 signed)
 pub fn build_peer_audit_response_email(
     from: &str,
     to: &str,
     response: &axiom_core_logic::types::PeerAuditResponse,
 ) -> Result<Vec<u8>, AntieError> {
-    let payload = serde_json::json!({
-        "peer_audit_response": serde_json::to_value(response)?,
-    });
-
-    let cbor_bytes = crate::cbor::json_to_cbor(&payload);
-    let encoded = BASE64.encode(&cbor_bytes);
+    let payload = AntiePayload { peer_audit_response: Some(response.clone()), ..Default::default() };
+    let encoded = BASE64.encode(&peer_audit_body_cbor(&payload)?);
 
     let request_id = uuid::Uuid::new_v4().to_string();
     let msg_id = format!("<{}.{}@axiom>",
@@ -816,23 +1014,16 @@ pub fn build_peer_audit_response_email(
     Ok(email.into_bytes())
 }
 
-/// Build a CL10 Fan-Out relay email (YP §28, CL10).
-///
-/// Sent to peer validators when relaying a Fan-Out message with TTL > 0.
-/// Subject: AXIOM/fanout/<uuid>
-/// Body: CBOR-encoded FanOutMessage (with decremented TTL)
-pub fn build_fanout_relay_email(
+/// §23.14.6 (KI#213): B → A, the signed NotHeld. Same message type as a
+/// raw-fields reply (`peer_audit_response`, RAW CBOR, no envelope) with the
+/// `peer_audit_not_held` payload key instead of `peer_audit_response`.
+pub fn build_peer_audit_not_held_email(
     from: &str,
     to: &str,
-    fanout_msg: &axiom_core_logic::types::FanOutMessage,
+    not_held: &axiom_core_logic::types::PeerAuditNotHeld,
 ) -> Result<Vec<u8>, AntieError> {
-    let payload = serde_json::json!({
-        "message_type": "fanout",
-        "fanout_message": serde_json::to_value(fanout_msg)?,
-    });
-
-    let cbor_bytes = crate::cbor::json_to_cbor(&payload);
-    let encoded = BASE64.encode(&cbor_bytes);
+    let payload = AntiePayload { peer_audit_not_held: Some(not_held.clone()), ..Default::default() };
+    let encoded = BASE64.encode(&peer_audit_body_cbor(&payload)?);
 
     let request_id = uuid::Uuid::new_v4().to_string();
     let msg_id = format!("<{}.{}@axiom>",
@@ -843,7 +1034,7 @@ pub fn build_fanout_relay_email(
     let mut email = String::new();
     email.push_str(&format!("From: {}\r\n", sanitize_header(from)));
     email.push_str(&format!("To: {}\r\n", sanitize_header(to)));
-    email.push_str(&format!("Subject: AXIOM/fanout/{}\r\n", request_id));
+    email.push_str(&format!("Subject: AXIOM/peer_audit_response/{}\r\n", request_id));
     email.push_str(&format!("Message-ID: {}\r\n", msg_id));
     email.push_str(&format!("Date: {}\r\n", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S +0000")));
     email.push_str("Content-Type: text/plain; charset=utf-8\r\n");
@@ -854,137 +1045,67 @@ pub fn build_fanout_relay_email(
     Ok(email.into_bytes())
 }
 
-/// Response payload
-///
-/// Wire-format note: payload fields that contain `Vec<u8>` byte sequences
-/// (validator_pk, signature, state_id, etc.) used to be typed as
-/// `serde_json::Value` and converted via `serde_json::to_value(...)` from
-/// the typed Lambda response. That intermediate flattened CBOR `Bytes` to
-/// JSON integer arrays and then back to CBOR Array<u8> on the wire — a
-/// lossy bandaid that masked byte-string corruption (rule #13 / two-day
-/// debug, May 2026). All payload fields now carry their typed
-/// `axiom_core_logic` structs so byte fields stay as CBOR `Bytes` end to
-/// end. The SDK's CBOR reader handles both shapes via `cbor_to_bytes`,
-/// so old `Array<u8>`-encoded responses still parse during the rollover.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponsePayload {
-    /// Success flag
-    pub success: bool,
+// `build_fanout_relay_email` DELETED 2026-09-25 (KI#175): it was the direct
+// ANTIE→ANTIE relay leg of `gateway.rs::handle_fanout_relay`, which now refuses the
+// type at the door. Fan-out is rebuilt as a wallet-carried transaction, not mail.
 
-    /// Request ID echoed back
-    pub request_id: String,
 
-    /// Witness signature (if successful)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub witness_signature: Option<axiom_core_logic::types::WitnessSig>,
-
-    /// Cheque for receiver (ValidatorCheque - needed for redemption)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cheque_for_receiver: Option<axiom_core_logic::types::ValidatorCheque>,
-
-    /// YPX-001 §1.5.1 — scar-consent voucher for the SENDER, issued by the
-    /// passcode-verifying validator. The sender's SDK attaches it to the
-    /// round's remaining witness requests so the other overlapped validators
-    /// verify consent instead of re-gating. Forwarded verbatim (unlike the
-    /// receiver-bound notification, which never rides the sender leg).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scar_consent_voucher: Option<axiom_core_logic::types::ScarConsentVoucher>,
-
-    /// Produced state_id (sender's new state after witness, receiver's new state after redeem)
-    /// Client MUST use this as consumed_state_id for their next transaction
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub produced_state_id: Option<Vec<u8>>,
-
-    /// Receipt (if k=3 reached)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt: Option<axiom_core_logic::types::Receipt>,
-
-    /// The commitment_hash computed by Core — returned on every successful witness
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commitment_hash: Option<Vec<u8>>,
-
-    /// State hash computed by Core (CL2/CL3) — top-level so the SDK can
-    /// rebuild receipt_commitment locally for partial-commit receipts.
-    /// Pre-fix this field was missing from ResponsePayload, so ANTIE
-    /// silently dropped Lambda's value during the deserialize→re-serialize
-    /// hop. SDK then wrote receipts with state_hash=[0u8;32], and Core's
-    /// strict-mode CL2 (post-4a81a34) rejected with
-    /// E_RECEIPT_COMMITMENT_MISMATCH on the next send. CLAUDE.md §13.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_hash: Option<Vec<u8>>,
-
-    /// Receipt commitment computed by Core (CL3) — top-level so the SDK
-    /// embeds it in receipts (especially partial-commit receipts where
-    /// Lambda's full Receipt isn't yet finalised). Same drop-by-mirror-drift
-    /// fix as state_hash above.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt_commitment: Option<Vec<u8>>,
-
-    /// Transaction ID — top-level on every successful witness response so
-    /// the SDK can build partial-commit receipts on the V1/V2 path where
-    /// `receipt: Option<Receipt>` is None. Required field on success
-    /// responses (no serde default — missing = producer bug, surface it).
-    /// Optional only because rejection / non-success responses don't have
-    /// a txid to forward.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub txid: Option<Vec<u8>>,
-
-    /// State ID (for genesis responses)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_id: Option<Vec<u8>>,
-
-    /// Error message (if failed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-
-    /// Rejection code
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rejection_code: Option<String>,
-
-    /// Lambda's structured ErrorResponse forwarded verbatim on rejection
-    /// (Phase 2 canonical). Carries the protocol-defined `code`,
-    /// `message`, `category`, and `recovery` hint. Clients dispatch
-    /// on `recovery` for state-drift handling. Pre-fix ANTIE flattened
-    /// the structured response into the `error` string and the SDK lost
-    /// the recovery hint entirely — w024 retry-loop bug observed in the
-    /// v3.0.0-beta5 soak (task #63).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_response: Option<axiom_errors::ErrorResponse>,
-
-    /// Validator hints — included in ALL responses (YP §27 peer discovery)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub validator_hints: Vec<axiom_core_logic::types::ValidatorHint>,
-
-    /// Updated sender FACT chain (YPX-001 §1.6) — only present when k=3 reached
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_fact_chain: Option<axiom_core_logic::types::FactChain>,
-
-    /// Updated receiver FACT chain after redeem (YPX-001 §1.6)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub receiver_fact_chain: Option<axiom_core_logic::types::FactChain>,
-
-    /// This validator's Dilithium FACT signature on the redeem link's
-    /// commitment. The SDK collects k of these to build the receiver's
-    /// redeem FactLink. Only present on redeem responses (None on
-    /// witness/heal/etc).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fact_signature: Option<Vec<u8>>,
-
-    /// Free-form metadata for non-protocol responses — query (wallet
-    /// state lookup), VSP (validator status), debug. JSON shape is
-    /// arbitrary per response type. Kept as `serde_json::Value` because
-    /// these responses don't carry byte fields that need
-    /// type-preservation; they're human-debuggable JSON. Witness /
-    /// redeem responses leave this `None`; only query-class responses
-    /// fill it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query_data: Option<serde_json::Value>,
-}
+/// ANTIE's mail-reply envelope — defined ONCE in Core (KI#173).
+pub use axiom_core_logic::types::ResponsePayload;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    /// KI#241 F-2 — the cheque delivery carries the witnessed send's ORIGIN
+    /// (`send_origin`, Core's `LegPreimage::origin_of(&tx)`) beside the cheque,
+    /// and a payload whose origin does not reproduce the cheque txid is never
+    /// built. MUTATION (run 2026-10-01): delete the `cheque_origin_matches`
+    /// refusal in `build_cheque_delivery_email` ⇒ the forged case builds ⇒ RED.
+    #[test]
+    fn ki241_cheque_delivery_carries_a_matching_send_origin() {
+        use axiom_core_logic::nabla_wire::LegPreimage;
+        let tx = axiom_core_logic::types::Transaction {
+            consumed_state_id: [0x11; 32],
+            client_pk: vec![0x22; 32],
+            sender_wallet_id: "alice@axiom.internal/0011223344".into(),
+            wallet_seq: 3,
+            receiver_wallet_id: "bob@axiom.internal/5566778899".into(),
+            amount: 4_200,
+            nonce: 9,
+            epoch: 1_790_000_000,
+            ..Default::default()
+        };
+        let txid = axiom_core_logic::compute::compute_txid(&tx);
+        let issuer = axiom_core_logic::cheque_build::ChequeIssuerContext {
+            issuer_id: [0x33; 32], issuer_pk: vec![0x44; 32], vbc_bundle: None,
+            carrier_type: "smtp".into(), carrier_address: String::new(), rate_bps: 0, created_at: 1,
+        };
+        let cheque = axiom_core_logic::cheque_build::build_cheque_unsigned(
+            &tx, txid, [0u8; 32], [0u8; 32], None, b"", None, 1, [0u8; 32], [0u8; 32], None, None, Vec::new(), &issuer,
+        );
+        let origin = LegPreimage::origin_of(&tx).unwrap();
+        let email = build_cheque_delivery_email("v@axiom.internal", "bob@axiom.internal", &cheque, None, &origin)
+            .expect("a matching origin builds");
+        let text = String::from_utf8(email).unwrap();
+        let body = text.split("\r\n\r\n").nth(1).unwrap().trim();
+        let cbor = BASE64.decode(body).unwrap();
+        #[derive(serde::Deserialize)]
+        struct Payload {
+            cheque: axiom_core_logic::types::ValidatorCheque,
+            send_origin: axiom_core_logic::types::OriginRecord,
+        }
+        let p: Payload = ciborium::from_reader(cbor.as_slice()).expect("payload decodes");
+        assert_eq!(p.send_origin, origin, "the origin rides the delivery");
+        assert_eq!(p.cheque.txid, txid);
+        assert!(axiom_core_logic::nabla_wire::cheque_origin_matches(&p.send_origin, &p.cheque.txid));
+
+        let mut forged = origin.clone();
+        forged.preimage.amount += 1;
+        assert!(build_cheque_delivery_email("v@axiom.internal", "bob@axiom.internal", &cheque, None, &forged).is_err(),
+            "an origin that does not reproduce the cheque txid is never delivered");
+    }
+
     #[test]
     fn test_parse_subject() {
         let (msg_type, req_id) = parse_subject("AXIOM/witness/req-12345").unwrap();
@@ -998,111 +1119,35 @@ mod tests {
         assert!(parse_subject("AXIOM/only-one").is_err());
     }
     
+    /// CBOR of a payload exactly as a sender writes it (`ciborium`, the UMP codec).
+    fn cbor_of(payload: &AntiePayload) -> Vec<u8> {
+        let mut v = Vec::new();
+        ciborium::into_writer(payload, &mut v).unwrap();
+        v
+    }
+
+    fn sample_request() -> axiom_core_logic::types::PeerAuditRequest {
+        axiom_core_logic::types::PeerAuditRequest {
+            txid: [0xA1; 32], challenge_nonce: [0x07; 32],
+            requester_pk: vec![0x42; 32], requester_sig: vec![0x99; 64],
+        }
+    }
+
     #[test]
     fn test_decode_payload_roundtrip() {
-        // Helper: serialize to CBOR, wrap in UmpEnvelope::Plain (post
-        // Stream B every client-class message ships wrapped), then
-        // Base64-encode.  Matches what the SDK build_email produces.
-        fn encode_payload(payload: &AntiePayload) -> String {
-            use axiom_core_logic::envelope::UmpEnvelope;
-            let json_value = serde_json::to_value(payload).unwrap();
-            let inner_cbor = crate::cbor::json_to_cbor(&json_value);
-            let env = UmpEnvelope::Plain { ump_bytes: inner_cbor };
-            BASE64.encode(env.to_cbor().unwrap())
-        }
-        
-        // Test with minimal fields (all defaults)
-        let minimal = AntiePayload {
-            query_params: None,
-            public_key: None,
-            balance: None,
-            group_members: None,
-            txid: None,
-            validator_pk: None,
-            sender_sig: None,
-            client_pk: None,
-            sphincs_pk_hex: None,
-            dilithium_pk_hex: None,
-            ed25519_pk_hex: None,
-            pgp_fingerprint_hex: None,
-            issued_at: None,
-            expires_at: None,
-            chain_depth: None,
-            issuer_set_hex: vec![],
-            scar_recovery_proof: None,
-            target_wallet_id: None,
-            proof_cap: None,
-            node_name_field: None,
-            auth_hash: None,
-            peer_audit_request: None,
-            peer_audit_response: None,
-            fanout_message: None,
-            raw_ump_body: vec![],
+        // Envelope-wrapped (every client-class message ships wrapped), Base64.
+        use axiom_core_logic::envelope::UmpEnvelope;
+        let payload = AntiePayload {
+            public_key: Some(vec![1u8; 32]), balance: Some(7), txid: Some(vec![2u8; 32]),
+            issuer_set_hex: vec!["ab".into()], ..Default::default()
         };
-        let encoded = encode_payload(&minimal);
-        let decoded = decode_payload("witness", &encoded).unwrap();
-        
-        // Test with populated fields (witness request scenario)
-        let witness_req = AntiePayload {
-            query_params: None,
-            public_key: None,
-            balance: None,
-            group_members: None,
-            txid: None,
-            validator_pk: None,
-            sender_sig: None,
-            client_pk: None,
-            sphincs_pk_hex: None,
-            dilithium_pk_hex: None,
-            ed25519_pk_hex: None,
-            pgp_fingerprint_hex: None,
-            issued_at: None,
-            expires_at: None,
-            chain_depth: None,
-            issuer_set_hex: vec![],
-            scar_recovery_proof: None,
-            target_wallet_id: None,
-            proof_cap: None,
-            node_name_field: None,
-            auth_hash: None,
-            peer_audit_request: None,
-            peer_audit_response: None,
-            fanout_message: None,
-            raw_ump_body: vec![],
-        };
-        let encoded = encode_payload(&witness_req);
-        let decoded = decode_payload("witness", &encoded).unwrap();
-        
-        // Test with redeem fields
-        let redeem_req = AntiePayload {
-            query_params: None,
-            public_key: None,
-            balance: None,
-            group_members: None,
-            txid: None,
-            validator_pk: None,
-            sender_sig: None,
-            client_pk: None,
-            sphincs_pk_hex: None,
-            dilithium_pk_hex: None,
-            ed25519_pk_hex: None,
-            pgp_fingerprint_hex: None,
-            issued_at: None,
-            expires_at: None,
-            chain_depth: None,
-            issuer_set_hex: vec![],
-            scar_recovery_proof: None,
-            target_wallet_id: None,
-            proof_cap: None,
-            node_name_field: None,
-            auth_hash: None,
-            peer_audit_request: None,
-            peer_audit_response: None,
-            fanout_message: None,
-            raw_ump_body: vec![],
-        };
-        let encoded = encode_payload(&redeem_req);
-        let decoded = decode_payload("witness", &encoded).unwrap();
+        let env = UmpEnvelope::Plain { ump_bytes: cbor_of(&payload) };
+        let decoded = decode_payload("witness", &BASE64.encode(env.to_cbor().unwrap())).unwrap();
+        assert_eq!(decoded.public_key, payload.public_key);
+        assert_eq!(decoded.balance, Some(7));
+        assert_eq!(decoded.txid, payload.txid);
+        assert_eq!(decoded.issuer_set_hex, vec!["ab".to_string()]);
+        assert_eq!(decoded.raw_ump_body, cbor_of(&payload), "raw body captured verbatim");
     }
 
     #[test]
@@ -1295,17 +1340,16 @@ mod tests {
     fn test_decode_payload_unwraps_plain_envelope() {
         use axiom_core_logic::envelope::UmpEnvelope;
         // Build a small AntiePayload, encode it as CBOR (inner UMP body).
-        let payload = AntiePayload {
-            ..Default::default()
-        };
-        let inner_json = serde_json::to_value(&payload).unwrap();
-        let inner_cbor = crate::cbor::json_to_cbor(&inner_json);
+        let payload = AntiePayload { balance: Some(3), ..Default::default() };
+        let inner_cbor = cbor_of(&payload);
+        let inner_cbor_copy = inner_cbor.clone();
         // Wrap in UmpEnvelope::Plain and base64-encode as the wire body.
         let env = UmpEnvelope::Plain { ump_bytes: inner_cbor };
         let outer_cbor = env.to_cbor().unwrap();
         let wire = BASE64.encode(&outer_cbor);
         // Decode and assert the inner payload survived round-trip.
         let decoded = decode_payload("witness", &wire).unwrap();
+        assert_eq!(decoded.raw_ump_body, inner_cbor_copy, "the inner body is what the envelope carried");
     }
 
     /// V↔V message types (peer_audit_*, fanout_relay) ship raw CBOR,
@@ -1313,14 +1357,13 @@ mod tests {
     #[test]
     fn test_decode_payload_v_to_v_accepts_raw_cbor() {
         let payload = AntiePayload {
-            peer_audit_request: Some(serde_json::json!({"txid": "audit-test"})),
+            peer_audit_request: Some(sample_request()),
             ..Default::default()
         };
-        let inner_json = serde_json::to_value(&payload).unwrap();
-        let inner_cbor = crate::cbor::json_to_cbor(&inner_json);
+        let inner_cbor = cbor_of(&payload);
         let wire = BASE64.encode(&inner_cbor);
         let decoded = decode_payload("peer_audit_request", &wire).unwrap();
-        assert!(decoded.peer_audit_request.is_some());
+        assert_eq!(decoded.peer_audit_request.unwrap().txid, [0xA1; 32]);
     }
 
     /// CLAUDE.md §13: a raw-CBOR body addressed to a client-class
@@ -1331,7 +1374,7 @@ mod tests {
         let payload = AntiePayload {
             ..Default::default()
         };
-        let inner_cbor = crate::cbor::json_to_cbor(&serde_json::to_value(&payload).unwrap());
+        let inner_cbor = cbor_of(&payload);
         let wire = BASE64.encode(&inner_cbor);
         let err = decode_payload("witness", &wire).unwrap_err();
         let msg = format!("{:?}", err);
@@ -1347,10 +1390,10 @@ mod tests {
     fn test_decode_payload_v_to_v_rejects_envelope() {
         use axiom_core_logic::envelope::UmpEnvelope;
         let payload = AntiePayload {
-            peer_audit_request: Some(serde_json::json!({"txid": "audit-test"})),
+            peer_audit_request: Some(sample_request()),
             ..Default::default()
         };
-        let inner_cbor = crate::cbor::json_to_cbor(&serde_json::to_value(&payload).unwrap());
+        let inner_cbor = cbor_of(&payload);
         let env = UmpEnvelope::Plain { ump_bytes: inner_cbor };
         let wire = BASE64.encode(env.to_cbor().unwrap());
         let err = decode_payload("peer_audit_request", &wire).unwrap_err();
@@ -1374,7 +1417,7 @@ mod tests {
         let payload = AntiePayload {
             ..Default::default()
         };
-        let inner_cbor = crate::cbor::json_to_cbor(&serde_json::to_value(&payload).unwrap());
+        let inner_cbor = cbor_of(&payload);
 
         // Validator's Ed25519 seed → load via EnvelopeDecryptor.
         let seed = [0x5a; 32];
@@ -1391,6 +1434,7 @@ mod tests {
         // Decrypted decode round-trips to the original payload.
         let decoded = decode_payload_with_context("witness", &wire, Some(&decryptor))
             .map_err(|_| ()).unwrap();
+        assert_eq!(decoded.raw_ump_body, cbor_of(&payload), "unsealed body is the sealed one");
     }
 
     /// Without a decryptor (e.g. a validator hasn't enabled the feature
@@ -1403,7 +1447,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
 
         let pk = SigningKey::from_bytes(&[0xC0; 32]).verifying_key().to_bytes();
-        let inner = crate::cbor::json_to_cbor(&serde_json::json!({"x": 1}));
+        let inner = cbor_of(&AntiePayload { balance: Some(1), ..Default::default() });
         let env = seal_to_validator(&pk, &inner).unwrap();
         let wire = BASE64.encode(env.to_cbor().unwrap());
 
@@ -1423,7 +1467,7 @@ mod tests {
 
         // Beta gets the message; Alpha tries to open it.
         let beta_pk = SigningKey::from_bytes(&[0xBB; 32]).verifying_key().to_bytes();
-        let inner = crate::cbor::json_to_cbor(&serde_json::json!({"to": "beta"}));
+        let inner = cbor_of(&AntiePayload { balance: Some(2), ..Default::default() });
         let env = seal_to_validator(&beta_pk, &inner).unwrap();
         let wire = BASE64.encode(env.to_cbor().unwrap());
 
@@ -1465,5 +1509,534 @@ mod tests {
         assert_eq!(parsed.scar_consent.passcode, n.passcode);
         assert_eq!(parsed.scar_consent.scar_count, n.scar_count);
         assert_eq!(parsed.scar_consent.amount, n.amount);
+    }
+}
+
+#[cfg(test)]
+mod vbc_delivery_tests {
+    use super::*;
+    fn sig() -> axiom_core_logic::types::VbcIssuerSignature {
+        axiom_core_logic::types::VbcIssuerSignature { signature: vec![7u8; 64], signer_sphincs_pk: vec![9u8; 32], commitment: [3u8; 32] }
+    }
+    #[test]
+    fn a_delivery_round_trips_by_body_and_ignores_the_subject() {
+        let raw = build_vbc_delivery_email("alpha@axiom", "validator_x@axiom", &sig()).unwrap();
+        let text = String::from_utf8(raw.clone()).unwrap();
+        // pad/replace the subject: recognition must not care
+        let padded = text.replacen("Subject: AXIOM/vbc/", "Subject: zzz padded ", 1);
+        let got = try_parse_vbc_delivery(padded.as_bytes()).expect("recognised by body");
+        assert_eq!(got.signer_sphincs_pk, vec![9u8; 32]);
+        assert_eq!(got.commitment, [3u8; 32]);
+    }
+    #[test]
+    fn a_transaction_mail_is_not_mistaken_for_a_delivery() {
+        let raw = b"From: a@b\r\nTo: c@d\r\nSubject: AXIOM/witness/abc\r\n\r\nAAAA\r\n";
+        assert!(try_parse_vbc_delivery(raw).is_none());
+    }
+}
+
+/// KI#242 (2026-10-02) — the JSON intermediate is gone from ANTIE's inbound
+/// decode and its outbound peer-audit mails. These tests pin that the change is
+/// wire-compatible BOTH ways during a mixed roll (old ANTIE ↔ new ANTIE), using
+/// the frozen pre-KI#242 codec as the oracle for what the OLD ANTIE wrote/read.
+#[cfg(test)]
+mod ki242_tests {
+    use super::*;
+    use axiom_core_logic::types::{GroupMember, PeerAuditNotHeld, PeerAuditRequest, PeerAuditResponse};
+
+    /// FROZEN COPY of the pre-KI#242 `antie/src/cbor.rs` (`cbor_to_json` /
+    /// `json_to_cbor`, verbatim as of `934a7ccd`). TEST-ONLY: it exists solely to
+    /// produce the bytes an OLD ANTIE writes and to decode the way an OLD ANTIE
+    /// reads, so the mixed-roll claim is MEASURED, not inferred. Never call it
+    /// from production code — that would be the KI#242 detour again.
+    mod legacy {
+        use serde_json::Value;
+
+        /// Decode CBOR bytes into a serde_json::Value.
+        ///
+        /// Byte strings (major type 2) are decoded as JSON arrays of integers
+        /// to match the existing serde deserialization for Vec<u8> and [u8; N].
+        /// Maximum CBOR nesting depth (DoS prevention).
+        const MAX_CBOR_DEPTH: usize = 32;
+        /// Maximum array/map element count.
+        const MAX_CBOR_ELEMENTS: u64 = 100_000;
+
+        pub fn cbor_to_json(data: &[u8]) -> Result<Value, String> {
+            let (value, _) = decode_item(data, 0, 0)?;
+            Ok(value)
+        }
+
+        fn decode_item(data: &[u8], mut pos: usize, depth: usize) -> Result<(Value, usize), String> {
+            if depth > MAX_CBOR_DEPTH {
+                return Err("CBOR nesting too deep (>32 levels)".into());
+            }
+            if pos >= data.len() {
+                return Err("Unexpected end of CBOR data".into());
+            }
+
+            let initial = data[pos];
+            let major = initial >> 5;
+            let info = initial & 0x1f;
+            pos += 1;
+
+            // Decode argument
+            let (arg, pos) = decode_arg(data, pos, info)?;
+
+            match major {
+                // Unsigned integer
+                0 => Ok((Value::Number(arg.into()), pos)),
+
+                // Negative integer
+                1 => {
+                    let val = -1i64 - arg as i64;
+                    Ok((Value::Number(val.into()), pos))
+                }
+
+                // Byte string → JSON array of integers (for serde Vec<u8> compat)
+                2 => {
+                    let end = pos + arg as usize;
+                    if end > data.len() {
+                        return Err(format!("Byte string length {} exceeds data at pos {}", arg, pos));
+                    }
+                    let bytes = &data[pos..end];
+                    let arr: Vec<Value> = bytes.iter().map(|&b| Value::Number(b.into())).collect();
+                    Ok((Value::Array(arr), end))
+                }
+
+                // Text string
+                3 => {
+                    let end = pos + arg as usize;
+                    if end > data.len() {
+                        return Err(format!("Text string length {} exceeds data at pos {}", arg, pos));
+                    }
+                    let s = std::str::from_utf8(&data[pos..end])
+                        .map_err(|e| format!("Invalid UTF-8 in text string: {}", e))?;
+                    Ok((Value::String(s.to_string()), end))
+                }
+
+                // Array
+                4 => {
+                    if arg > MAX_CBOR_ELEMENTS {
+                        return Err(format!("CBOR array too large: {} elements", arg));
+                    }
+                    let count = arg as usize;
+                    let mut items = Vec::with_capacity(count.min(1024));
+                    let mut p = pos;
+                    for _ in 0..count {
+                        let (item, next) = decode_item(data, p, depth + 1)?;
+                        items.push(item);
+                        p = next;
+                    }
+                    Ok((Value::Array(items), p))
+                }
+
+                // Map
+                5 => {
+                    if arg > MAX_CBOR_ELEMENTS {
+                        return Err(format!("CBOR map too large: {} entries", arg));
+                    }
+                    let count = arg as usize;
+                    let mut map = serde_json::Map::with_capacity(count.min(1024));
+                    let mut p = pos;
+                    for _ in 0..count {
+                        let (key, next) = decode_item(data, p, depth + 1)?;
+                        p = next;
+                        let (value, next) = decode_item(data, p, depth + 1)?;
+                        p = next;
+
+                        // Map keys must be strings
+                        let key_str = match key {
+                            Value::String(s) => s,
+                            Value::Number(n) => n.to_string(),
+                            _ => return Err(format!("Non-string map key: {:?}", key)),
+                        };
+                        map.insert(key_str, value);
+                    }
+                    Ok((Value::Object(map), p))
+                }
+
+                // Simple values and floats (major type 7)
+                7 => {
+                    match initial {
+                        0xf4 => Ok((Value::Bool(false), pos)),
+                        0xf5 => Ok((Value::Bool(true), pos)),
+                        0xf6 | 0xf7 => Ok((Value::Null, pos)),
+                        0xfb => {
+                            // Float64: decode_arg already read 8 bytes as u64 in `arg`
+                            let val = f64::from_bits(arg);
+                            let num = serde_json::Number::from_f64(val)
+                                .ok_or_else(|| format!("Cannot represent float {} as JSON number", val))?;
+                            Ok((Value::Number(num), pos))
+                        }
+                        _ => Err(format!("Unknown CBOR simple value: {:#x}", initial)),
+                    }
+                }
+
+                _ => Err(format!("Unknown CBOR major type: {}", major)),
+            }
+        }
+
+        fn decode_arg(data: &[u8], pos: usize, info: u8) -> Result<(u64, usize), String> {
+            match info {
+                0..=23 => Ok((info as u64, pos)),
+                24 => {
+                    if pos >= data.len() {
+                        return Err("Truncated 1-byte arg".into());
+                    }
+                    Ok((data[pos] as u64, pos + 1))
+                }
+                25 => {
+                    if pos + 2 > data.len() {
+                        return Err("Truncated 2-byte arg".into());
+                    }
+                    let val = u16::from_be_bytes(data[pos..pos+2].try_into()
+                        .map_err(|_| "Invalid 2-byte CBOR arg")?);
+                    Ok((val as u64, pos + 2))
+                }
+                26 => {
+                    if pos + 4 > data.len() {
+                        return Err("Truncated 4-byte arg".into());
+                    }
+                    let val = u32::from_be_bytes(data[pos..pos+4].try_into()
+                        .map_err(|_| "Invalid 4-byte CBOR arg")?);
+                    Ok((val as u64, pos + 4))
+                }
+                27 => {
+                    if pos + 8 > data.len() {
+                        return Err("Truncated 8-byte arg".into());
+                    }
+                    let val = u64::from_be_bytes(data[pos..pos+8].try_into()
+                        .map_err(|_| "Invalid 8-byte CBOR arg")?);
+                    Ok((val, pos + 8))
+                }
+                31 => Err("Indefinite-length CBOR not supported".into()),
+                _ => Err(format!("Reserved CBOR additional info: {}", info)),
+            }
+        }
+
+        /// Encode serde_json::Value to CBOR bytes.
+        ///
+        /// Used for ANTIE → PMC responses.
+        /// JSON arrays of small integers (0-255) are encoded as CBOR byte strings
+        /// when they look like byte arrays (all elements 0-255).
+        pub fn json_to_cbor(value: &Value) -> Vec<u8> {
+            let mut buf = Vec::new();
+            encode_value(value, &mut buf);
+            buf
+        }
+
+        fn encode_value(value: &Value, buf: &mut Vec<u8>) {
+            match value {
+                Value::Null => buf.push(0xf6),
+                Value::Bool(true) => buf.push(0xf5),
+                Value::Bool(false) => buf.push(0xf4),
+                Value::Number(n) => {
+                    if let Some(u) = n.as_u64() {
+                        encode_head(0, u, buf);
+                    } else if let Some(i) = n.as_i64() {
+                        if i < 0 {
+                            encode_head(1, (-1 - i) as u64, buf);
+                        } else {
+                            encode_head(0, i as u64, buf);
+                        }
+                    } else if let Some(f) = n.as_f64() {
+                        buf.push(0xfb);
+                        buf.extend_from_slice(&f.to_bits().to_be_bytes());
+                    }
+                }
+                Value::String(s) => {
+                    let bytes = s.as_bytes();
+                    encode_head(3, bytes.len() as u64, buf);
+                    buf.extend_from_slice(bytes);
+                }
+                Value::Array(arr) => {
+                    // Heuristic: if all elements are integers 0-255, encode as byte string
+                    if is_byte_array(arr) {
+                        let bytes: Vec<u8> = arr.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                            .collect();
+                        encode_head(2, bytes.len() as u64, buf);
+                        buf.extend_from_slice(&bytes);
+                    } else {
+                        encode_head(4, arr.len() as u64, buf);
+                        for item in arr {
+                            encode_value(item, buf);
+                        }
+                    }
+                }
+                Value::Object(map) => {
+                    encode_head(5, map.len() as u64, buf);
+                    for (k, v) in map {
+                        // Keys as text strings
+                        let kb = k.as_bytes();
+                        encode_head(3, kb.len() as u64, buf);
+                        buf.extend_from_slice(kb);
+                        encode_value(v, buf);
+                    }
+                }
+            }
+        }
+
+        fn encode_head(major: u8, value: u64, buf: &mut Vec<u8>) {
+            let mt = major << 5;
+            if value < 24 {
+                buf.push(mt | value as u8);
+            } else if value < 0x100 {
+                buf.push(mt | 24);
+                buf.push(value as u8);
+            } else if value < 0x10000 {
+                buf.push(mt | 25);
+                buf.extend_from_slice(&(value as u16).to_be_bytes());
+            } else if value < 0x100000000 {
+                buf.push(mt | 26);
+                buf.extend_from_slice(&(value as u32).to_be_bytes());
+            } else {
+                buf.push(mt | 27);
+                buf.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+
+        /// Check if a JSON array looks like a byte array (all integers 0-255).
+        fn is_byte_array(arr: &[Value]) -> bool {
+            if arr.is_empty() {
+                return false; // Empty arrays stay as arrays
+            }
+            arr.iter().all(|v| {
+                matches!(v, Value::Number(n) if n.as_u64().is_some_and(|u| u <= 255))
+            })
+        }
+    }
+
+    fn enc<T: serde::Serialize>(v: &T) -> Vec<u8> {
+        let mut b = Vec::new();
+        ciborium::into_writer(v, &mut b).unwrap();
+        b
+    }
+
+    /// Body bytes of a built mail (header/body split, Base64-decoded).
+    fn mail_body(mail: &[u8]) -> Vec<u8> {
+        let text = std::str::from_utf8(mail).unwrap();
+        BASE64.decode(text.split("\r\n\r\n").nth(1).unwrap().trim()).unwrap()
+    }
+
+    // Real shapes: 32-byte ids, an Ed25519-sized key and a 64-byte sig. Byte
+    // values span 0x00..=0xff and include values < 24 / ≥ 24 (1- vs 2-byte CBOR
+    // ints), so the byte-string-vs-array difference is exercised for real.
+    fn req() -> PeerAuditRequest {
+        PeerAuditRequest {
+            txid: core::array::from_fn(|i| (i * 8) as u8),
+            challenge_nonce: core::array::from_fn(|i| 255 - i as u8),
+            requester_pk: (0..32u8).map(|i| i.wrapping_mul(37)).collect(),
+            requester_sig: (0..64u8).map(|i| i.wrapping_mul(11).wrapping_add(3)).collect(),
+        }
+    }
+    fn resp() -> PeerAuditResponse {
+        PeerAuditResponse {
+            txid: [0x00; 32], challenge_nonce: [0xff; 32],
+            sender_balance: u64::MAX, receiver_balance: 0, state_id: core::array::from_fn(|i| i as u8),
+            amount: 1_000_000_007,
+            responder_pk: vec![0x17; 32], responder_sig: (0..64u8).collect(),
+        }
+    }
+    fn not_held() -> PeerAuditNotHeld {
+        PeerAuditNotHeld {
+            txid: [0x18; 32], challenge_nonce: [0x01; 32],
+            responder_pk: vec![0xAB; 32], responder_sig: vec![0x00; 64],
+        }
+    }
+
+    /// The OLD ANTIE's outbound peer-audit body, exactly as its builders made it:
+    /// `json!({key: to_value(x)})` → `json_to_cbor`.
+    fn old_body<T: serde::Serialize>(key: &str, v: &T) -> Vec<u8> {
+        let mut m = serde_json::Map::new();
+        m.insert(key.to_string(), serde_json::to_value(v).unwrap());
+        legacy::json_to_cbor(&serde_json::Value::Object(m))
+    }
+
+    /// The OLD ANTIE's read of a body: `cbor_to_json` → the `Value` field →
+    /// `serde_json::from_value::<CoreType>` (what `gateway.rs` did).
+    fn old_read<T: serde::de::DeserializeOwned>(body: &[u8], key: &str) -> Result<T, String> {
+        let v = legacy::cbor_to_json(body)?;
+        serde_json::from_value(v.get(key).cloned().ok_or("key absent")?).map_err(|e| e.to_string())
+    }
+
+    /// MIXED ROLL, direction 1: an OLD ANTIE's peer-audit mail decodes in the NEW
+    /// ANTIE to the identical Core value (request, response, NotHeld).
+    #[test]
+    fn mixed_roll_old_antie_bytes_decode_in_new_antie() {
+        let b = old_body("peer_audit_request", &req());
+        let got = decode_payload("peer_audit_request", &BASE64.encode(&b)).unwrap();
+        assert_eq!(enc(&got.peer_audit_request.unwrap()), enc(&req()));
+
+        let b = old_body("peer_audit_response", &resp());
+        let got = decode_payload("peer_audit_response", &BASE64.encode(&b)).unwrap();
+        assert_eq!(enc(&got.peer_audit_response.unwrap()), enc(&resp()));
+        assert!(got.peer_audit_not_held.is_none());
+
+        let b = old_body("peer_audit_not_held", &not_held());
+        let got = decode_payload("peer_audit_response", &BASE64.encode(&b)).unwrap();
+        assert_eq!(enc(&got.peer_audit_not_held.unwrap()), enc(&not_held()));
+        assert!(got.peer_audit_response.is_none());
+    }
+
+    /// MIXED ROLL, direction 2: the NEW ANTIE's peer-audit mails (the real
+    /// builders) decode in an OLD ANTIE to the identical Core value. Also MEASURES
+    /// that the bytes differ from the old ones (struct field order; `[u8; 32]` /
+    /// `Vec<u8>` written as CBOR arrays) — compatibility rests on both decoders
+    /// accepting both forms, not on identical bytes.
+    #[test]
+    fn mixed_roll_new_antie_bytes_decode_in_old_antie() {
+        let m = build_peer_audit_request_email("a@axiom.internal", "b@axiom.internal", &req()).unwrap();
+        let body = mail_body(&m);
+        assert_ne!(body, old_body("peer_audit_request", &req()), "measured: the outbound bytes changed");
+        let old: PeerAuditRequest = old_read(&body, "peer_audit_request").unwrap();
+        assert_eq!(enc(&old), enc(&req()));
+        // …and the new ANTIE reads its own mail.
+        let new = decode_payload("peer_audit_request", &BASE64.encode(&body)).unwrap();
+        assert_eq!(enc(&new.peer_audit_request.unwrap()), enc(&req()));
+
+        let m = build_peer_audit_response_email("b@axiom.internal", "a@axiom.internal", &resp()).unwrap();
+        let body = mail_body(&m);
+        let old: PeerAuditResponse = old_read(&body, "peer_audit_response").unwrap();
+        assert_eq!(enc(&old), enc(&resp()));
+        assert!(legacy::cbor_to_json(&body).unwrap().get("peer_audit_not_held").is_none(),
+            "an old ANTIE must not see a NotHeld key on a raw-fields reply");
+
+        let m = build_peer_audit_not_held_email("b@axiom.internal", "a@axiom.internal", &not_held()).unwrap();
+        let body = mail_body(&m);
+        let old: PeerAuditNotHeld = old_read(&body, "peer_audit_not_held").unwrap();
+        assert_eq!(enc(&old), enc(&not_held()));
+        assert!(legacy::cbor_to_json(&body).unwrap().get("peer_audit_response").is_none(),
+            "a NotHeld mail sets exactly one peer_audit_* key");
+    }
+
+    /// `init_genesis_dev` with group members + the dev payload the SDK really
+    /// sends (`sdk/client/src/send.rs::build_genesis_dev_payload`: a CBOR map,
+    /// `public_key` as a byte string). Old-path and new-path decode agree, for
+    /// both a ciborium-native body and an old-codec body.
+    #[test]
+    fn group_members_and_genesis_dev_decode_identically() {
+        use ciborium::Value as C;
+        let members = vec![
+            GroupMember { member_pk: vec![0x31; 32], share_bps: 6_000, available: 0 },
+            GroupMember { member_pk: (0..32u8).collect(), share_bps: 4_000, available: 123_456_789_012 },
+        ];
+        let member_val = |m: &GroupMember| C::Map(vec![
+            (C::Text("member_pk".into()), C::Bytes(m.member_pk.clone())),
+            (C::Text("share_bps".into()), C::Integer(m.share_bps.into())),
+            (C::Text("available".into()), C::Integer(m.available.into())),
+        ]);
+        let native = enc(&C::Map(vec![
+            (C::Text("public_key".into()), C::Bytes(vec![0x09; 32])),
+            (C::Text("balance".into()), C::Integer(500u64.into())),
+            (C::Text("group_members".into()), C::Array(members.iter().map(member_val).collect())),
+        ]));
+        let mut m = serde_json::Map::new();
+        m.insert("public_key".into(), serde_json::to_value(vec![0x09u8; 32]).unwrap());
+        m.insert("balance".into(), 500.into());
+        m.insert("group_members".into(), serde_json::to_value(&members).unwrap());
+        let old_codec = legacy::json_to_cbor(&serde_json::Value::Object(m));
+
+        for body in [native, old_codec] {
+            let new = decode_payload_inner(&body).unwrap();
+            assert_eq!(new.group_members.as_ref().unwrap(), &members);
+            assert_eq!(new.public_key.as_deref(), Some(&[0x09u8; 32][..]));
+            assert_eq!(new.balance, Some(500));
+            let old: Vec<GroupMember> = old_read(&body, "group_members").unwrap();
+            assert_eq!(old, members, "old and new decode agree");
+        }
+    }
+
+    /// `query_params.wallet_pk` — byte string (ciborium-native sender) and
+    /// integer array (old-codec sender, or an array writer) both yield the key,
+    /// exactly as the old `from_value::<Vec<u8>>` did; a missing key is `None`.
+    #[test]
+    fn query_params_wallet_pk_decodes_identically() {
+        use ciborium::Value as C;
+        let pk: Vec<u8> = (0..32u8).map(|i| i * 7).collect();
+        let as_bytes = enc(&C::Map(vec![(C::Text("query_params".into()),
+            C::Map(vec![(C::Text("wallet_pk".into()), C::Bytes(pk.clone()))]))]));
+        let as_array = enc(&C::Map(vec![(C::Text("query_params".into()),
+            C::Map(vec![(C::Text("wallet_pk".into()),
+                C::Array(pk.iter().map(|b| C::Integer((*b).into())).collect()))]))]));
+        for body in [as_bytes, as_array] {
+            let p = decode_payload_inner(&body).unwrap();
+            assert_eq!(crate::gateway::query_wallet_pk(p.query_params.as_ref().unwrap()), Some(pk.clone()));
+            let old = legacy::cbor_to_json(&body).unwrap();
+            let old_pk: Vec<u8> = serde_json::from_value(old["query_params"]["wallet_pk"].clone()).unwrap();
+            assert_eq!(old_pk, pk);
+        }
+        let no_key = enc(&C::Map(vec![(C::Text("query_params".into()),
+            C::Map(vec![(C::Text("other".into()), C::Integer(1.into()))]))]));
+        let p = decode_payload_inner(&no_key).unwrap();
+        assert_eq!(crate::gateway::query_wallet_pk(p.query_params.as_ref().unwrap()), None);
+    }
+
+    /// The defect class itself: a field whose CBOR form the hand decoder could
+    /// not represent (here a float32 — equally a tag or an indefinite length)
+    /// made the OLD path drop the WHOLE mail, so the peer-audit answer beside it
+    /// was silently lost (A then read silence and banned `NonResponds`). The
+    /// typed decode carries the answer and ignores the field it does not know.
+    #[test]
+    fn a_new_field_no_longer_drops_the_mail() {
+        use ciborium::Value as C;
+        let body = enc(&C::Map(vec![
+            (C::Text("peer_audit_response".into()), C::serialized(&resp()).unwrap()),
+            (C::Text("future_field".into()), C::Float(0.5)),
+        ]));
+        // ciborium writes 0.5 in its shortest lossless form (f16), which the old
+        // decoder refused.
+        assert!(legacy::cbor_to_json(&body).is_err(), "old path: the whole mail is undecodable");
+        let new = decode_payload("peer_audit_response", &BASE64.encode(&body)).unwrap();
+        assert_eq!(enc(&new.peer_audit_response.unwrap()), enc(&resp()), "new path: carried intact");
+
+        // Same for an integer map key the old decoder stringified into a
+        // collision with a text key (`1` ≡ `"1"`): the old path merged them.
+        let colliding = enc(&C::Map(vec![
+            (C::Text("1".into()), C::Integer(1.into())),
+            (C::Integer(1.into()), C::Integer(2.into())),
+        ]));
+        assert_eq!(legacy::cbor_to_json(&colliding).unwrap().as_object().unwrap().len(), 1,
+            "old path: two distinct keys collapsed into one");
+    }
+
+    /// The nesting limit refuses nothing the old decoder took, and stays bounded:
+    /// for every depth 1..=40, old-accepted ⇒ new-accepted, and the new decode
+    /// refuses everything deeper than 33 containers. MEASURED difference: at
+    /// exactly 32 nested arrays with a non-empty innermost, old refused, new
+    /// accepts (the old cap counted the scalar).
+    #[test]
+    fn depth_limit_never_refuses_what_the_old_decoder_took() {
+        use ciborium::Value as C;
+        let mut checked = 0;
+        let mut differ = Vec::new();
+        for inner_empty in [true, false] {
+            for n in 1..=40usize {
+                let mut v = if inner_empty { C::Array(vec![]) } else { C::Array(vec![C::Integer(0.into())]) };
+                for _ in 1..n { v = C::Array(vec![v]); }
+                let body = enc(&C::Map(vec![(C::Text("x".into()), v)]));
+                let old_ok = legacy::cbor_to_json(&body).is_ok();
+                let new_ok = decode_payload_inner(&body).is_ok();
+                assert!(!old_ok || new_ok, "depth {} (inner_empty={}): old accepted, new refused", n, inner_empty);
+                assert_eq!(new_ok, n + 1 <= BODY_RECURSION_LIMIT, "depth {}: new decode bounded by the limit", n);
+                if old_ok != new_ok { differ.push((n, inner_empty)); }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 80);
+        assert_eq!(differ, vec![(32, false)], "the one measured difference");
+    }
+
+    /// Measures the claim in `build_response`'s comment: ciborium writes a
+    /// `Vec<u8>` as a CBOR ARRAY (major 4), not a byte string — serde gives
+    /// `Vec<u8>` no bytes hint. Compatibility never relied on it: every ANTIE /
+    /// SDK reader accepts both forms (`ciborium` `deserialize_seq` takes a byte
+    /// string too).
+    #[test]
+    fn ciborium_writes_vec_u8_as_an_array() {
+        let b = enc(&vec![1u8, 2, 3]);
+        assert_eq!(b[0] >> 5, 4, "major type 4 (array)");
+        let back: Vec<u8> = ciborium::from_reader(&enc(&ciborium::Value::Bytes(vec![1, 2, 3]))[..]).unwrap();
+        assert_eq!(back, vec![1, 2, 3], "a byte string decodes into Vec<u8>");
     }
 }

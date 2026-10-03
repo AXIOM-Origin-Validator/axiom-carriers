@@ -11,6 +11,8 @@
 
 use crate::error::AntieError;
 use axiom_core_logic::types::GroupMember;
+// KI#173 batch 4: the Lambda IPC envelopes are Core's — ANTIE keeps no copy.
+use axiom_core_logic::types::{GatewayRequest, GatewayResponse};
 // UMP: wire types live in axiom_core_logic. ANTIE imports them as aliases
 // (LambdaWitnessResponse / LambdaRedeemResponse / OutboundPeerAuditInfo)
 // for backward compat with internal callers, but the underlying type is
@@ -39,6 +41,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use std::process::Stdio;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info};
 
 /// Encode a value to CBOR bytes for IPC (Yellow Paper §16.8.5.3 — CBOR everywhere)
@@ -59,6 +63,19 @@ fn ipc_decode<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T, AntieError
 pub struct LambdaClient {
     /// Connection mode
     mode: LambdaMode,
+    /// KI#80: whether the lambda child is believed alive. Subprocess mode
+    /// only — the supervision loop is the writer. TCP mode has no child to
+    /// supervise and leaves this `true`.
+    lambda_alive: Arc<AtomicBool>,
+    /// KI#80: set by `stop()` so the supervision loop never respawns a
+    /// child that was killed on purpose.
+    shutting_down: Arc<AtomicBool>,
+    /// KI#80: the carrier URI list last pushed via
+    /// `send_set_carriers_request`, re-pushed to a respawned child.
+    /// Lambda persists everything else it needs in its own storage; the
+    /// carrier list is the one piece of boot-time state that only ANTIE
+    /// holds (gateway.rs pushes it exactly once at startup).
+    carrier_uris: Mutex<Option<Vec<String>>>,
 }
 
 /// Lambda connection mode
@@ -80,16 +97,25 @@ enum LambdaMode {
 }
 
 impl LambdaClient {
+    /// Shared constructor body — every mode starts believed-alive and
+    /// not shutting down.
+    fn with_mode(mode: LambdaMode) -> Self {
+        Self {
+            mode,
+            lambda_alive: Arc::new(AtomicBool::new(true)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            carrier_uris: Mutex::new(None),
+        }
+    }
+
     /// Create Lambda client in TCP mode
     pub fn new_tcp(address: &str, timeout_secs: u64) -> Self {
-        Self {
-            mode: LambdaMode::Tcp {
-                address: address.to_string(),
-                timeout: std::time::Duration::from_secs(timeout_secs),
-                tls_connector: None,
-                tls_server_name: None,
-            },
-        }
+        Self::with_mode(LambdaMode::Tcp {
+            address: address.to_string(),
+            timeout: std::time::Duration::from_secs(timeout_secs),
+            tls_connector: None,
+            tls_server_name: None,
+        })
     }
 
     pub fn new_tcp_tls(
@@ -115,25 +141,21 @@ impl LambdaClient {
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
         let sni = rustls::pki_types::ServerName::try_from(server_name.to_string())
             .map_err(|e| AntieError::ConfigError(format!("TLS server name '{server_name}': {e}")))?;
-        Ok(Self {
-            mode: LambdaMode::Tcp {
-                address: address.to_string(),
-                timeout: std::time::Duration::from_secs(timeout_secs),
-                tls_connector: Some(connector),
-                tls_server_name: Some(sni),
-            },
-        })
+        Ok(Self::with_mode(LambdaMode::Tcp {
+            address: address.to_string(),
+            timeout: std::time::Duration::from_secs(timeout_secs),
+            tls_connector: Some(connector),
+            tls_server_name: Some(sni),
+        }))
     }
-    
+
     /// Create Lambda client in subprocess mode (preferred)
     pub fn new_subprocess(binary_path: PathBuf, config_path: PathBuf) -> Self {
-        Self {
-            mode: LambdaMode::Subprocess {
-                child: Mutex::new(None),
-                binary_path,
-                config_path,
-            },
-        }
+        Self::with_mode(LambdaMode::Subprocess {
+            child: Mutex::new(None),
+            binary_path,
+            config_path,
+        })
     }
     
     /// Create from config
@@ -155,10 +177,23 @@ impl LambdaClient {
             if guard.is_some() {
                 return Ok(()); // Already running
             }
-            
-            info!("Starting Lambda subprocess: {:?}", binary_path);
-            info!("  Config: {:?}", config_path);
+            Self::spawn_child_into(&mut *guard, binary_path, config_path)?;
+            self.lambda_alive.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
 
+    /// Spawn the lambda child into `guard`. Factored out of `start()` so
+    /// the KI#80 supervision loop respawns through the SAME path (log
+    /// sink discovery included) instead of a copy.
+    fn spawn_child_into(
+        guard: &mut Option<Child>,
+        binary_path: &PathBuf,
+        config_path: &PathBuf,
+    ) -> Result<(), AntieError> {
+        info!("Starting Lambda subprocess: {:?}", binary_path);
+        info!("  Config: {:?}", config_path);
+        {
             // Pipe Lambda's stderr to a dedicated `lambda.log` file
             // alongside antie.log. Pre-fix, this was `Stdio::inherit()`,
             // which on paper inherits ANTIE's redirected fd 2 — but in
@@ -220,9 +255,13 @@ impl LambdaClient {
         }
         Ok(())
     }
-    
+
     /// Stop Lambda subprocess
     pub async fn stop(&self) -> Result<(), AntieError> {
+        // KI#80: mark the shutdown as deliberate BEFORE killing, so the
+        // supervision loop never races us into respawning the child we
+        // are about to kill.
+        self.shutting_down.store(true, Ordering::SeqCst);
         if let LambdaMode::Subprocess { child, .. } = &self.mode {
             let mut guard = child.lock().await;
             if let Some(mut process) = guard.take() {
@@ -231,6 +270,133 @@ impl LambdaClient {
             }
         }
         Ok(())
+    }
+
+    /// KI#80: handle to the liveness flag, for the /health endpoint.
+    pub fn lambda_alive_handle(&self) -> Arc<AtomicBool> {
+        self.lambda_alive.clone()
+    }
+
+    /// KI#80: supervise the lambda child — detect exit, reap the corpse,
+    /// respawn with backoff, re-push the carrier list.
+    ///
+    /// Before this loop existed, an OOM-killed lambda left antie holding a
+    /// stale handle to a zombie: every IPC call returned `Broken pipe`, the
+    /// unreaped corpse kept `pgrep | wc -l` reading full-strength, and the
+    /// validator was a black hole until a human rolled it (gamma 28 min,
+    /// zeta 13 min, 2026-08-08 soak). A process dying is survivable; a
+    /// supervisor that never notices is not.
+    ///
+    /// Backoff is bounded in RATE, not in attempts: 1s doubling to a 60s
+    /// cap, reset once a child survives `RESPAWN_STABLE_SECS`. Giving up
+    /// permanently after N attempts would recreate the outage this exists
+    /// to close (an OOM storm in hour 1 would kill the validator for the
+    /// rest of the run) — instead a persistently-dying child costs one
+    /// spawn per minute, stays ERROR-loud, and reads `lambda_alive: false`
+    /// on /health throughout.
+    ///
+    /// TCP mode returns immediately: there is no child to supervise.
+    pub async fn supervision_loop(&self) {
+        let (child, binary_path, config_path) = match &self.mode {
+            LambdaMode::Subprocess { child, binary_path, config_path } =>
+                (child, binary_path, config_path),
+            LambdaMode::Tcp { .. } => return,
+        };
+
+        /// How often the child is checked for having exited.
+        const RESPAWN_POLL_SECS: u64 = 2;
+        /// First respawn delay after a death.
+        const RESPAWN_BACKOFF_MIN_SECS: u64 = 1;
+        /// Backoff ceiling — a persistently-dying child costs one spawn
+        /// attempt per minute, never a hot loop.
+        const RESPAWN_BACKOFF_MAX_SECS: u64 = 60;
+        /// A child that survives this long resets the backoff.
+        const RESPAWN_STABLE_SECS: u64 = 60;
+
+        let mut backoff_secs = RESPAWN_BACKOFF_MIN_SECS;
+        let mut last_spawn = std::time::Instant::now();
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(RESPAWN_POLL_SECS)).await;
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // Check (and reap — try_wait waits on an exited child, so the
+            // zombie that fooled every `pgrep` count disappears here).
+            let needs_spawn = {
+                let mut guard = child.lock().await;
+                match guard.as_mut() {
+                    None => true, // stop() then start() race, or a failed respawn
+                    Some(process) => match process.try_wait() {
+                        Ok(Some(status)) => {
+                            tracing::error!(
+                                "[KI#80] lambda child EXITED (status: {status}) — \
+                                 reaped; will respawn in {backoff_secs}s",
+                            );
+                            *guard = None;
+                            true
+                        }
+                        Ok(None) => false,
+                        Err(e) => {
+                            tracing::error!("[KI#80] lambda child try_wait failed: {e}");
+                            false
+                        }
+                    },
+                }
+            };
+
+            if !needs_spawn {
+                self.lambda_alive.store(true, Ordering::SeqCst);
+                if last_spawn.elapsed().as_secs() >= RESPAWN_STABLE_SECS {
+                    backoff_secs = RESPAWN_BACKOFF_MIN_SECS;
+                }
+                continue;
+            }
+
+            self.lambda_alive.store(false, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
+
+            {
+                let mut guard = child.lock().await;
+                if guard.is_none() {
+                    match Self::spawn_child_into(&mut *guard, binary_path, config_path) {
+                        Ok(()) => {
+                            drop(guard);
+                            last_spawn = std::time::Instant::now();
+                            self.lambda_alive.store(true, Ordering::SeqCst);
+                            tracing::warn!("[KI#80] lambda child RESPAWNED");
+                            // Re-push the carrier list the gateway pushed at
+                            // startup — the one boot-time input lambda does
+                            // not recover from its own storage. Without it a
+                            // respawned lambda serves VSP with the hardcoded
+                            // placeholder and peers cannot route here.
+                            let uris = self.carrier_uris.lock().await.clone();
+                            if let Some(uris) = uris {
+                                let rid = format!("set-carriers-respawn-{}", std::process::id());
+                                match self.send_set_carriers_request(&rid, uris).await {
+                                    Ok(ack) => tracing::warn!(
+                                        "[KI#80] re-pushed {} carrier URI(s) to respawned lambda",
+                                        ack.accepted,
+                                    ),
+                                    Err(e) => tracing::error!(
+                                        "[KI#80] set_carriers re-push to respawned lambda \
+                                         failed: {e} — VSP will report empty carriers",
+                                    ),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("[KI#80] lambda respawn FAILED: {e}");
+                        }
+                    }
+                }
+            }
+            backoff_secs = (backoff_secs * 2).min(RESPAWN_BACKOFF_MAX_SECS);
+        }
     }
     
     /// Send witness request to Lambda
@@ -363,31 +529,10 @@ impl LambdaClient {
         }
     }
     
-    /// Send scar heal request to Lambda
-    ///
-    /// Forwards a ScarRecoveryProof to Lambda for verification and application.
-    /// Returns downstream targets for notification forwarding.
-    pub async fn send_scar_heal_request(
-        &self,
-        proof: &serde_json::Value,
-        target_wallet_id: &str,
-    ) -> Result<ScarHealResponse, AntieError> {
-        let request = LambdaScarHealRequest {
-            request_type: "scar_heal".to_string(),
-            request_id: uuid::Uuid::new_v4().to_string(),
-            scar_recovery_proof: proof.clone(),
-            target_wallet_id: target_wallet_id.to_string(),
-        };
-
-        let response_bytes = self.send_raw_request(&request).await?;
-        let response: ScarHealResponse = ciborium::from_reader(&response_bytes[..])
-            .map_err(|e| AntieError::LambdaError(format!("CBOR decode scar_heal response: {}", e)))?;
-
-        Ok(response)
-    }
-
     /// §4.5: Send set_auth_hash request to Lambda.
-    /// Sets auth_hash on a wallet for stolen-key protection.
+    /// Sets `auth_hash` on a wallet. NOT stolen-key protection — the owner key
+    /// is derived from the wallet private key, so it proves what `client_sig`
+    /// already proves (KI#108). Unauthenticated on this path (KI#107).
     /// Phase 1 multi-carrier discovery (YP §27.5.2, 2026-05-14).
     ///
     /// Push the operator's configured `[carriers.*]` set to Lambda as a
@@ -403,6 +548,10 @@ impl LambdaClient {
         request_id: &str,
         carriers: Vec<String>,
     ) -> Result<axiom_core_logic::types::SetCarriersAck, AntieError> {
+        // KI#80: remember the list so the supervision loop can re-push it
+        // to a respawned child. Cached even if this send fails — the
+        // respawn re-push is then the retry.
+        *self.carrier_uris.lock().await = Some(carriers.clone());
         let envelope = axiom_core_logic::types::GatewayRequest::SetCarriers(
             axiom_core_logic::types::SetCarriersRequest {
                 request_id: request_id.to_string(),
@@ -413,12 +562,40 @@ impl LambdaClient {
         let response: GatewayResponse = ipc_decode(&response_bytes)?;
         match response {
             GatewayResponse::SetCarriersAck(ack) => Ok(ack),
-            GatewayResponse::Error { error_response, .. } => {
-                Err(AntieError::LambdaError(error_response.message.clone()))
+            GatewayResponse::Error(env) => {
+                Err(AntieError::LambdaRejected(env.error_response))
             }
             _ => Err(AntieError::LambdaError(
                 "Unexpected response type for set_carriers".into(),
             )),
+        }
+    }
+
+    /// ValidatorJoin §5 Phase 1 (KI#173) — the Core `GatewayRequest::VBCSignRequest`, decoded as
+    /// the Core `GatewayResponse`. The hand-rolled request/response copies that stood in the
+    /// gateway read the approval as a failure (no `success` field on `VBCSignApprovalResponse`).
+    pub async fn send_vbc_sign_request(
+        &self,
+        payload: axiom_core_logic::types::VBCSignRequestPayload,
+    ) -> Result<axiom_core_logic::types::VBCSignApprovalResponse, AntieError> {
+        let response_bytes = self.send_raw_request(&GatewayRequest::VBCSignRequest(payload)).await?;
+        match ipc_decode::<GatewayResponse>(&response_bytes)? {
+            GatewayResponse::VBCSignApprovalResult(r) => Ok(r),
+            GatewayResponse::Error(env) => Err(AntieError::LambdaRejected(env.error_response)),
+            _ => Err(AntieError::LambdaError("Unexpected response type for vbc_sign_request".into())),
+        }
+    }
+
+    /// ValidatorJoin §5 Phase 2 (KI#173) — the Core `GatewayRequest::VBCSignCommit`.
+    pub async fn send_vbc_sign_commit(
+        &self,
+        payload: axiom_core_logic::types::VBCSignCommitPayload,
+    ) -> Result<axiom_core_logic::types::VBCSignCommitResponse, AntieError> {
+        let response_bytes = self.send_raw_request(&GatewayRequest::VBCSignCommit(payload)).await?;
+        match ipc_decode::<GatewayResponse>(&response_bytes)? {
+            GatewayResponse::VBCSignCommitResult(r) => Ok(r),
+            GatewayResponse::Error(env) => Err(AntieError::LambdaRejected(env.error_response)),
+            _ => Err(AntieError::LambdaError("Unexpected response type for vbc_sign_commit".into())),
         }
     }
 
@@ -428,29 +605,19 @@ impl LambdaClient {
         public_key: &[u8],
         auth_hash: &[u8],
     ) -> Result<LambdaSetAuthHashResponse, AntieError> {
-        #[derive(serde::Serialize)]
-        struct SetAuthHashRequest {
-            #[serde(rename = "type")]
-            request_type: String,
-            request_id: String,
-            public_key: Vec<u8>,
-            auth_hash: Vec<u8>,
-        }
-
-        let request = SetAuthHashRequest {
-            request_type: "set_auth_hash".to_string(),
+        let request = GatewayRequest::SetAuthHash(axiom_core_logic::types::SetAuthHashRequest {
             request_id: request_id.to_string(),
             public_key: public_key.to_vec(),
             auth_hash: auth_hash.to_vec(),
-        };
+        });
 
         let response_bytes = self.send_raw_request(&request).await?;
         let response: GatewayResponse = ipc_decode(&response_bytes)?;
 
         match response {
             GatewayResponse::SetAuthHashResult(result) => Ok(result),
-            GatewayResponse::Error { error_response, .. } => {
-                Err(AntieError::LambdaError(error_response.message.clone()))
+            GatewayResponse::Error(env) => {
+                Err(AntieError::LambdaRejected(env.error_response))
             }
             _ => Err(AntieError::LambdaError("Unexpected response type for set_auth_hash".into())),
         }
@@ -463,27 +630,18 @@ impl LambdaClient {
         &self,
         diffusion_id: &[u8; 32],
     ) -> Result<bool, AntieError> {
-        #[derive(serde::Serialize)]
-        struct FanOutDedupRequest {
-            #[serde(rename = "type")]
-            request_type: String,
-            request_id: String,
-            diffusion_id: Vec<u8>,
-        }
-
-        let request = FanOutDedupRequest {
-            request_type: "fanout_dedup".to_string(),
+        let request = GatewayRequest::FanOutDedup(axiom_core_logic::types::FanOutDedupRequest {
             request_id: format!("dedup-{}", hex::encode(&diffusion_id[..8])),
             diffusion_id: diffusion_id.to_vec(),
-        };
+        });
 
         let response_bytes = self.send_raw_request(&request).await?;
         let response: GatewayResponse = ipc_decode(&response_bytes)?;
 
         match response {
             GatewayResponse::FanOutDedupResult(result) => Ok(result.already_seen),
-            GatewayResponse::Error { error_response, .. } => {
-                Err(AntieError::LambdaError(error_response.message.clone()))
+            GatewayResponse::Error(env) => {
+                Err(AntieError::LambdaRejected(env.error_response))
             }
             _ => Err(AntieError::LambdaError("Unexpected response type for fanout_dedup".into())),
         }
@@ -496,26 +654,17 @@ impl LambdaClient {
         &self,
         diffusion_id: &[u8; 32],
     ) -> Result<(), AntieError> {
-        #[derive(serde::Serialize)]
-        struct FanOutMarkRequest {
-            #[serde(rename = "type")]
-            request_type: String,
-            request_id: String,
-            diffusion_id: Vec<u8>,
-        }
-
-        let request = FanOutMarkRequest {
-            request_type: "fanout_mark".to_string(),
+        let request = GatewayRequest::FanOutMark(axiom_core_logic::types::FanOutMarkRequest {
             request_id: format!("mark-{}", hex::encode(&diffusion_id[..8])),
             diffusion_id: diffusion_id.to_vec(),
-        };
+        });
 
         let response_bytes = self.send_raw_request(&request).await?;
         let response: GatewayResponse = ipc_decode(&response_bytes)?;
 
         match response {
             GatewayResponse::FanOutMarkResult(_) => Ok(()),
-            GatewayResponse::Error { error_response, .. } => Err(AntieError::LambdaError(error_response.message.clone())),
+            GatewayResponse::Error(env) => Err(AntieError::LambdaRejected(env.error_response)),
             _ => Err(AntieError::LambdaError("Unexpected response for fanout_mark".into())),
         }
     }
@@ -539,11 +688,45 @@ impl LambdaClient {
 
         match response {
             GatewayResponse::PeerAuditResult(result) => Ok(result),
-            GatewayResponse::Error { error_response, .. } => {
-                Err(AntieError::LambdaError(error_response.message.clone()))
+            GatewayResponse::Error(env) => {
+                Err(AntieError::LambdaRejected(env.error_response))
             }
             _ => Err(AntieError::LambdaError("Unexpected response type for peer_audit_request".into())),
         }
+    }
+
+    /// §23.14.3: tell Lambda our carrier failed to send its peer-audit request,
+    /// so it un-marks the dispatch (B is not timed) and retries on the next witness.
+    pub async fn send_peer_audit_dispatch_failed(&self, target_email: &str, error: &str) -> Result<(), AntieError> {
+        let ipc_request = axiom_core_logic::types::GatewayRequest::PeerAuditDispatchFailed(
+            axiom_core_logic::types::PeerAuditDispatchFailedEnvelope {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                target_email: target_email.to_string(),
+                error: error.to_string(),
+            }
+        );
+        let response_bytes = self.send_raw_request(&ipc_request).await?;
+        let _response: GatewayResponse = ipc_decode(&response_bytes)?;
+        Ok(())
+    }
+
+    /// §23.14.6 (KI#213): forward the audited validator's signed NotHeld to
+    /// Lambda — an ANSWER to our pending audit (clears it, or bans a proven
+    /// co-witness), never silence.
+    pub async fn send_peer_audit_not_held(
+        &self,
+        not_held: &axiom_core_logic::types::PeerAuditNotHeld,
+    ) -> Result<(), AntieError> {
+        let ipc_request = axiom_core_logic::types::GatewayRequest::PeerAuditNotHeld(
+            axiom_core_logic::types::PeerAuditNotHeldEnvelope {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                peer_audit_not_held: not_held.clone(),
+            }
+        );
+
+        let response_bytes = self.send_raw_request(&ipc_request).await?;
+        let _response: GatewayResponse = ipc_decode(&response_bytes)?;
+        Ok(())
     }
 
     /// §23.14.6: Send inbound peer audit response to Lambda for verification.
@@ -584,8 +767,8 @@ impl LambdaClient {
 
         match response {
             GatewayResponse::StateResult(qr) => Ok(qr),
-            GatewayResponse::Error { error_response, .. } => {
-                Err(AntieError::LambdaError(error_response.message.clone()))
+            GatewayResponse::Error(env) => {
+                Err(AntieError::LambdaRejected(env.error_response))
             }
             _ => Err(AntieError::LambdaError("Unexpected response type for query".into())),
         }
@@ -597,24 +780,17 @@ impl LambdaClient {
         &self,
         request_id: &str,
     ) -> Result<LambdaValidatorStatusResponse, AntieError> {
-        #[derive(serde::Serialize)]
-        struct VspRequest {
-            #[serde(rename = "type")]
-            request_type: String,
-            request_id: String,
-        }
-        let request = VspRequest {
-            request_type: "validator_status".to_string(),
+        let request = GatewayRequest::ValidatorStatus(axiom_core_logic::types::ValidatorStatusRequest {
             request_id: request_id.to_string(),
-        };
+        });
 
         let response_bytes = self.send_raw_request(&request).await?;
         let response: GatewayResponse = ipc_decode(&response_bytes)?;
 
         match response {
             GatewayResponse::ValidatorStatusResult(vsp) => Ok(vsp),
-            GatewayResponse::Error { error_response, .. } => {
-                Err(AntieError::LambdaError(error_response.message.clone()))
+            GatewayResponse::Error(env) => {
+                Err(AntieError::LambdaRejected(env.error_response))
             }
             _ => Err(AntieError::LambdaError("Unexpected response type for VSP".into())),
         }
@@ -823,8 +999,8 @@ impl LambdaClient {
                 info!("Lambda witness response: success={}", wr.success);
                 Ok(*wr)
             }
-            GatewayResponse::Error { error_response, .. } => {
-                Err(AntieError::LambdaError(error_response.message.clone()))
+            GatewayResponse::Error(env) => {
+                Err(AntieError::LambdaRejected(env.error_response))
             }
             _ => Err(AntieError::LambdaError("Unexpected response type for witness".into())),
         }
@@ -839,8 +1015,8 @@ impl LambdaClient {
                 info!("Lambda redeem response: success={}", rr.success);
                 Ok(rr)
             }
-            GatewayResponse::Error { error_response, .. } => {
-                Err(AntieError::LambdaError(error_response.message.clone()))
+            GatewayResponse::Error(env) => {
+                Err(AntieError::LambdaRejected(env.error_response))
             }
             _ => Err(AntieError::LambdaError("Unexpected response type for redeem".into())),
         }
@@ -958,9 +1134,7 @@ impl LambdaClient {
             .map_err(|e| AntieError::LambdaError(format!("Parse genesis response failed: {}", e)))?;
         match response {
             CanonicalGatewayResponse::InitGenesisResult(payload) => Ok(payload),
-            CanonicalGatewayResponse::Error(env) => Err(AntieError::LambdaError(
-                format!("{}: {}", env.error_response.code, env.error_response.message)
-            )),
+            CanonicalGatewayResponse::Error(env) => Err(AntieError::LambdaRejected(env.error_response)),
             _ => Err(AntieError::LambdaError("Unexpected response type for genesis".into())),
         }
     }
@@ -1018,12 +1192,12 @@ impl LambdaClient {
         
         match response {
             GatewayResponse::AckResult(ack_resp) => Ok(ack_resp),
-            GatewayResponse::Error { error_response, .. } => {
+            GatewayResponse::Error(env) => {
                 Ok(LambdaAckResponse {
                     request_id: String::new(),
                     success: false,
                     new_status: None,
-                    error_response: Some(error_response),
+                    error_response: Some(env.error_response),
                 })
             }
             _ => Err(AntieError::LambdaError("Unexpected response type for ACK".into())),
@@ -1103,10 +1277,9 @@ impl LambdaClient {
                 let stream = TcpStream::connect(address).await
                     .map_err(|e| AntieError::LambdaError(format!("Connect failed: {}", e)))?;
                 
-                let request = HealthRequest {
-                    request_type: "health".to_string(),
+                let request = GatewayRequest::Health(axiom_core_logic::types::HealthRequest {
                     request_id: format!("health-{}", uuid::Uuid::new_v4()),
-                };
+                });
                 
                 let buf = ipc_encode(&request)?;
                 
@@ -1160,13 +1333,6 @@ pub enum LambdaConnectionMode {
 
 
 
-/// Health request
-#[derive(Debug, Serialize)]
-struct HealthRequest {
-    #[serde(rename = "type")]
-    request_type: String,
-    request_id: String,
-}
 
 
 
@@ -1177,86 +1343,11 @@ struct HealthRequest {
 
 
 
-/// Scar heal request (sent to Lambda for proof application)
-#[derive(Debug, Serialize)]
-pub struct LambdaScarHealRequest {
-    pub request_type: String,
-    pub request_id: String,
-    pub scar_recovery_proof: serde_json::Value,
-    pub target_wallet_id: String,
-}
-
-/// Scar heal response from Lambda
-#[derive(Debug, Deserialize)]
-pub struct ScarHealResponse {
-    pub success: bool,
-    pub downstream_targets: Vec<DownstreamTarget>,
-    pub error: Option<String>,
-}
-
-/// Downstream receiver target for scar heal notification
-#[derive(Debug, Clone, Deserialize)]
-pub struct DownstreamTarget {
-    pub wallet_id: String,
-    pub email: String,
-}
 
 
 
 
 
-/// Response envelope from Lambda
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-#[allow(clippy::large_enum_variant)]
-enum GatewayResponse {
-    #[serde(rename = "witness_result")]
-    WitnessResult(Box<LambdaWitnessResponse>),
-    
-    #[serde(rename = "redeem_result")]
-    RedeemResult(LambdaRedeemResponse),
-    
-    #[serde(rename = "ack_result")]
-    AckResult(LambdaAckResponse),
-    
-    #[serde(rename = "state_result")]
-    StateResult(LambdaQueryResponse),
-
-    #[serde(rename = "error")]
-    Error {
-        #[serde(rename = "request_id")]
-        _request_id: String,
-        error_response: axiom_errors::ErrorResponse,
-    },
-
-    #[serde(rename = "health_result")]
-    Health {
-        #[serde(rename = "request_id")]
-        _request_id: String,
-        #[serde(rename = "status")]
-        _status: String,
-    },
-
-    #[serde(rename = "validator_status_result")]
-    ValidatorStatusResult(LambdaValidatorStatusResponse),
-
-    #[serde(rename = "peer_audit_result")]
-    PeerAuditResult(LambdaPeerAuditResult),
-
-    #[serde(rename = "set_auth_hash_result")]
-    SetAuthHashResult(LambdaSetAuthHashResponse),
-
-    #[serde(rename = "fanout_dedup_result")]
-    FanOutDedupResult(LambdaFanOutDedupResponse),
-
-    #[serde(rename = "fanout_mark_result")]
-    #[allow(dead_code)]
-    FanOutMarkResult(LambdaFanOutMarkResponse),
-
-    /// Phase 1 multi-carrier discovery ack (YP §27.5.2).
-    #[serde(rename = "set_carriers_ack")]
-    SetCarriersAck(axiom_core_logic::types::SetCarriersAck),
-}
 
 
 
@@ -1284,17 +1375,22 @@ mod tests {
     /// Structured data round-trips through CBOR encode/decode.
     #[test]
     fn ipc_encode_decode_struct_roundtrip() {
-        let req = HealthRequest {
-            request_type: "health".into(),
+        let req = GatewayRequest::Health(axiom_core_logic::types::HealthRequest {
             request_id: "h-42".into(),
-        };
+        });
         let encoded = ipc_encode(&req).unwrap();
         assert!(!encoded.is_empty());
 
-        // Decode as generic CBOR value to verify structure
-        let value: serde_json::Value = ciborium::from_reader(&encoded[..]).unwrap();
-        assert_eq!(value["type"], "health");
-        assert_eq!(value["request_id"], "h-42");
+        // KI#173 batch 4: the Core variant carries the same keys ANTIE's
+        // deleted `HealthRequest` copy sent — `type` + `request_id`.
+        let value: ciborium::Value = ipc_decode(&encoded).unwrap();
+        let map = value.as_map().unwrap();
+        let text = |key: &str| map.iter()
+            .find(|(k, _)| k.as_text() == Some(key))
+            .and_then(|(_, v)| v.as_text().map(str::to_string));
+        assert_eq!(text("type").as_deref(), Some("health"));
+        assert_eq!(text("request_id").as_deref(), Some("h-42"));
+        assert!(matches!(ipc_decode::<GatewayRequest>(&encoded).unwrap(), GatewayRequest::Health(_)));
     }
 
     /// Large nested payload round-trips correctly.
@@ -1335,48 +1431,94 @@ mod tests {
 
     // ── GatewayResponse variant parsing ─────────────────────────────
 
-    /// GatewayResponse::Error variant deserializes from CBOR.
+    fn text(s: &str) -> ciborium::Value {
+        ciborium::Value::Text(s.to_string())
+    }
+
+    fn cbor_map(entries: Vec<(&str, ciborium::Value)>) -> ciborium::Value {
+        ciborium::Value::Map(entries.into_iter().map(|(k, v)| (text(k), v)).collect())
+    }
+
+    /// KI#173 batch 4 — the error frame Lambda writes (`type: "error"`,
+    /// `request_id`, `error_response` at the top level) decodes as Core's
+    /// `GatewayResponse::Error(ErrorEnvelope)`, the shape ANTIE's deleted
+    /// copy spelled as a struct variant. Built as a CBOR map, not from Core's
+    /// type, so the test pins the wire keys independently.
     #[test]
     fn gateway_response_error_variant_cbor() {
-        let error_resp = serde_json::json!({
-            "type": "error",
-            "request_id": "err-1",
-            "error_response": {
-                "version": 1,
-                "code": "E_LAMBDA_INVALID_REQUEST",
-                "category": "client_bug",
-                "message": "something failed"
-            }
-        });
-        let mut cbor_buf = Vec::new();
-        ciborium::into_writer(&error_resp, &mut cbor_buf).unwrap();
+        let frame = cbor_map(vec![
+            ("type", text("error")),
+            ("request_id", text("err-1")),
+            ("error_response", cbor_map(vec![
+                ("version", ciborium::Value::Integer(1.into())),
+                ("code", text("E_LAMBDA_INVALID_REQUEST")),
+                ("category", text("client_bug")),
+                ("message", text("something failed")),
+            ])),
+        ]);
+        let cbor_buf = ipc_encode(&frame).unwrap();
 
-        let decoded: GatewayResponse = ipc_decode(&cbor_buf).unwrap();
-        match decoded {
-            GatewayResponse::Error { _request_id, error_response } => {
-                assert_eq!(_request_id, "err-1");
-                assert_eq!(error_response.message, "something failed");
-                assert_eq!(error_response.code.as_str(), "E_LAMBDA_INVALID_REQUEST");
+        match ipc_decode::<GatewayResponse>(&cbor_buf).unwrap() {
+            GatewayResponse::Error(env) => {
+                assert_eq!(env.request_id, "err-1");
+                assert_eq!(env.error_response.message, "something failed");
+                assert_eq!(env.error_response.code.as_str(), "E_LAMBDA_INVALID_REQUEST");
             }
             other => panic!("Expected Error variant, got {:?}", other),
         }
     }
 
-    /// GatewayResponse::Health variant deserializes from CBOR.
+    /// KI#173 batch 4 — the Core request variants that replaced ANTIE's local
+    /// copies put the same bytes on the pipe: the tag first, then the fields
+    /// in the order the deleted structs declared them.
+    #[test]
+    fn core_request_variants_encode_like_the_deleted_local_structs() {
+        let bytes_list = |xs: &[u8]| ciborium::Value::Array(
+            xs.iter().map(|b| ciborium::Value::Integer((*b).into())).collect());
+        let old_set_auth_hash = cbor_map(vec![
+            ("type", text("set_auth_hash")),
+            ("request_id", text("r-1")),
+            ("public_key", bytes_list(&[1, 2, 3])),
+            ("auth_hash", bytes_list(&[9, 8])),
+        ]);
+        let new_set_auth_hash = GatewayRequest::SetAuthHash(axiom_core_logic::types::SetAuthHashRequest {
+            request_id: "r-1".into(), public_key: vec![1, 2, 3], auth_hash: vec![9, 8],
+        });
+        assert_eq!(ipc_encode(&old_set_auth_hash).unwrap(), ipc_encode(&new_set_auth_hash).unwrap());
+
+        let old_mark = cbor_map(vec![
+            ("type", text("fanout_mark")),
+            ("request_id", text("mark-1")),
+            ("diffusion_id", bytes_list(&[7; 32])),
+        ]);
+        let new_mark = GatewayRequest::FanOutMark(axiom_core_logic::types::FanOutMarkRequest {
+            request_id: "mark-1".into(), diffusion_id: vec![7; 32],
+        });
+        assert_eq!(ipc_encode(&old_mark).unwrap(), ipc_encode(&new_mark).unwrap());
+
+        let old_vsp = cbor_map(vec![("type", text("validator_status")), ("request_id", text("v-1"))]);
+        let new_vsp = GatewayRequest::ValidatorStatus(axiom_core_logic::types::ValidatorStatusRequest {
+            request_id: "v-1".into(),
+        });
+        assert_eq!(ipc_encode(&old_vsp).unwrap(), ipc_encode(&new_vsp).unwrap());
+    }
+
+    /// KI#173 batch 4 — Lambda answers `health` with `HealthResult(HealthResponse)`
+    /// (`server.rs` → `engine.health()`). ANTIE's deleted copy expected
+    /// `{ request_id, status }`, a shape Lambda never sends.
     #[test]
     fn gateway_response_health_variant_cbor() {
-        let health_resp = serde_json::json!({
-            "type": "health_result",
-            "request_id": "h-1",
-            "status": "ok"
-        });
-        let mut cbor_buf = Vec::new();
-        ciborium::into_writer(&health_resp, &mut cbor_buf).unwrap();
+        let frame = cbor_map(vec![
+            ("type", text("health_result")),
+            ("status", text("ok")),
+            ("core_connected", ciborium::Value::Bool(true)),
+            ("pending_transactions", ciborium::Value::Integer(0.into())),
+        ]);
+        let cbor_buf = ipc_encode(&frame).unwrap();
 
-        let decoded: GatewayResponse = ipc_decode(&cbor_buf).unwrap();
-        match decoded {
-            GatewayResponse::Health { .. } => {} // expected
-            other => panic!("Expected Health variant, got {:?}", other),
+        match ipc_decode::<GatewayResponse>(&cbor_buf).unwrap() {
+            GatewayResponse::HealthResult(h) => assert_eq!(h.status, "ok"),
+            other => panic!("Expected HealthResult variant, got {:?}", other),
         }
     }
 
@@ -1439,6 +1581,130 @@ mod tests {
             PathBuf::from("/usr/bin/lambda"),
             PathBuf::from("/etc/lambda.toml"),
         );
+    }
+
+    // ── KI#80: lambda child supervision ─────────────────────────────
+    //
+    // Real-process tests: a shell script that ignores its `--config`
+    // arg stands in for the lambda binary. The supervisor's job —
+    // detect exit, reap, respawn, honor stop() — is exercised against
+    // genuine child processes and genuine SIGKILL, exactly the event
+    // the 2026-08-08 soak produced. Timings are generous multiples of
+    // the loop's 2s poll.
+
+    /// Write an executable script that ignores args and sleeps — and return
+    /// only once it is EXEC-ABLE.
+    ///
+    /// KI#238 (test-only): while `fs::write` holds the stub's write descriptor,
+    /// another test thread in this binary may `fork()`; the child inherits the
+    /// descriptor until its own `exec` closes it (O_CLOEXEC), and in that window
+    /// `execve(stub)` fails with ETXTBSY — `ki80_supervisor_respawns_killed_child`
+    /// failed once that way in a full preflight. A temp-name + `rename` alone does
+    /// NOT close it (the inherited descriptor is on the same inode). What does:
+    /// after our own descriptor is closed no NEW fork can inherit it, so ONE
+    /// successful exec proves no writer remains. The helper probes the stub
+    /// (`--stub-probe` exits at once) and retries ONLY on ETXTBSY, so
+    /// `LambdaClient` (the code under test) never sees the race — and is not
+    /// changed for it.
+    fn write_stub_lambda(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        const ETXTBSY: i32 = 26;
+        let path = dir.join("stub-lambda.sh");
+        std::fs::write(&path, "#!/bin/sh\n[ \"$1\" = \"--stub-probe\" ] && exit 0\nexec sleep 300\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..500 {
+            match std::process::Command::new(&path).arg("--stub-probe").status() {
+                Ok(st) => {
+                    assert!(st.success(), "stub probe exited {st}");
+                    return path;
+                }
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("stub probe: {e}"),
+            }
+        }
+        panic!("stub {} stayed ETXTBSY for 5 s", path.display());
+    }
+
+    async fn child_pid(client: &LambdaClient) -> Option<u32> {
+        match &client.mode {
+            LambdaMode::Subprocess { child, .. } =>
+                child.lock().await.as_ref().and_then(|c| c.id()),
+            _ => None,
+        }
+    }
+
+    /// SIGKILL the child (the OOM killer's signal); the supervisor must
+    /// reap it, respawn a NEW child, and restore lambda_alive.
+    /// Mutation check performed during development: with the
+    /// `spawn_child_into` call replaced by a constant Err, this test
+    /// fails (no new pid ever appears) — verified red 2026-08-08.
+    #[tokio::test]
+    async fn ki80_supervisor_respawns_killed_child() {
+        let tmp = std::env::temp_dir().join(format!("ki80-respawn-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("config")).unwrap();
+        let stub = write_stub_lambda(&tmp);
+        let client = Arc::new(LambdaClient::new_subprocess(
+            stub, tmp.join("config").join("antie.toml"),
+        ));
+        client.start().await.unwrap();
+        let first_pid = child_pid(&client).await.expect("child spawned");
+
+        let sup = client.clone();
+        let task = tokio::spawn(async move { sup.supervision_loop().await });
+
+        // The OOM killer's exact move.
+        std::process::Command::new("kill")
+            .args(["-9", &first_pid.to_string()])
+            .status().unwrap();
+
+        // Within poll(2s) + backoff(1s) + margin the supervisor must have
+        // reaped the corpse and spawned a REPLACEMENT process.
+        let mut respawned = None;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Some(pid) = child_pid(&client).await {
+                if pid != first_pid {
+                    respawned = Some(pid);
+                    break;
+                }
+            }
+        }
+        let new_pid = respawned.expect("supervisor never respawned the killed child");
+        assert_ne!(new_pid, first_pid);
+        assert!(client.lambda_alive.load(Ordering::SeqCst),
+                "lambda_alive must read true after a successful respawn");
+
+        client.stop().await.unwrap();
+        task.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// stop() is deliberate: the supervisor must NOT resurrect a child
+    /// that was killed on purpose.
+    #[tokio::test]
+    async fn ki80_stop_prevents_respawn() {
+        let tmp = std::env::temp_dir().join(format!("ki80-stop-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("config")).unwrap();
+        let stub = write_stub_lambda(&tmp);
+        let client = Arc::new(LambdaClient::new_subprocess(
+            stub, tmp.join("config").join("antie.toml"),
+        ));
+        client.start().await.unwrap();
+
+        let sup = client.clone();
+        let task = tokio::spawn(async move { sup.supervision_loop().await });
+
+        client.stop().await.unwrap();
+
+        // Give the supervisor several poll cycles to (wrongly) act.
+        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+        assert!(child_pid(&client).await.is_none(),
+                "supervisor respawned a deliberately-stopped child");
+
+        task.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 

@@ -8,8 +8,9 @@ parsing, no content inspection. Just: who is this for → write to inbox.
 
 Three listeners:
   - SMTP  (2525) — inbound delivery. Validators send TO recipients.
-  - HTTP  (2526) — GET /pop & /peek. Dev convenience for cross-machine
-                   wallet clients without filesystem access.
+  - HTTP  (2526) — monitoring/admin ONLY (/health, /stats, /routes,
+                   /events, /per-recipient). NO mail over HTTP — reading
+                   mail is POP3 only (the no-HTTP-to-validators rule).
   - POP3  (2527) — standard RFC 1939 pull. The macOS AxiomKiddo.app
                    speaks this; any POP3 mail client also works.
 
@@ -23,7 +24,6 @@ Usage:
 
 import asyncio
 import argparse
-import base64
 import json
 import logging
 import os
@@ -62,6 +62,381 @@ def deliver_to_maildir(maildir_inbox: Path, message_data: bytes) -> str:
     return filename
 
 
+# ── FATMAMA IS DEV-ONLY AND CLUSTER-SCOPED (YPX-019 §3.1, NORMATIVE) ──────────
+# Design ruling, 2026-08-20: "FATMAMA is a dev only system. It should only takes in
+# @axiom or @axiom.internal mail ONLY, anything else will reject immediately."
+#
+# Before this guard the ONLY thing stopping external mail was the absence of a
+# route — accidental protection, not designed. The live log shows it working by
+# luck: `DROP spammer@freemail.example`, `DROP leslie32@karabotan.com` were
+# refused for being UNKNOWN, not for being external.
+#
+# ⚠ AND THAT LUCK RUNS OUT UNDER `--auto-create`, which is exactly how the three
+# remote FATMAMAs run, bound to 0.0.0.0. In that mode an unknown recipient is
+# CREATED rather than dropped, so `attacker@evil.com` would have minted
+# `fatmama-mailbox-attacker-evil-com/` and been accepted. The check therefore
+# MUST run BEFORE auto-create, not after.
+CLUSTER_DOMAINS = ("axiom", "axiom.internal")
+
+# Test-domain list (YPX-019 §3.1, amended 2026-09-26): extra domains a developer
+# wants FATMAMA to take like @axiom mail — e.g. `trustmesh.org` on a test network.
+# Plain text beside the routes file, one domain per line, `#` comments. Re-read on
+# every check, so adding or removing a line takes effect without a restart.
+# CARRIER ROUTING ONLY — Core's dev class (`is_dev_wallet`) is untouched, so a
+# listed domain's wallets stay REAL class. Set by `serve`; None = no list.
+DOMAINS_FILE_NAME = "fatmama-domains.list"
+_domains_file = None
+
+
+def extra_domains() -> set:
+    """The listed test domains (lower-case, no leading '@'); empty if no file."""
+    if _domains_file is None:
+        return set()
+    try:
+        text = _domains_file.read_text()
+    except OSError:
+        return set()
+    out = set()
+    for line in text.splitlines():
+        d = line.split("#", 1)[0].strip().lower().lstrip("@")
+        if d:
+            out.add(d)
+    return out
+
+
+def is_cluster_recipient(addr: str) -> bool:
+    """True iff `addr` is inside the dev cluster or a listed test domain. EXACT
+    domain match only — no subdomains, no suffix matching (`evil-axiom.com` must
+    not pass)."""
+    if not addr or "@" not in addr:
+        return False
+    local, _, domain = addr.rpartition("@")
+    domain = domain.strip().lower()
+    return bool(local) and (domain in CLUSTER_DOMAINS or domain in extra_domains())
+
+
+def my_domains(routes: dict = None) -> set:
+    """The domains this FATMAMA answers to, for unwrapping delivery addresses.
+
+    `socket.gethostname()` is the SHORT local name (`iota`), not the public
+    name a wallet publishes (`mail.example.org`, or a bare IP). The public name is
+    therefore DERIVED from what this site already advertises — see
+    `_advertised_hosts` — and is never hand-configured.
+
+    Getting this set wrong is costly in both directions: too small and we
+    refuse our own wallets' cheques, too large and we open mail addressed to
+    another site. It therefore FAILS CLOSED — an unrecognised domain is simply
+    "not mine", which routes the message onward instead of filing it here.
+    """
+    names = {HOSTNAME.strip().lower(), socket.getfqdn().strip().lower()}
+    names |= _advertised_hosts(routes)
+    return {canonical_host(n) for n in names if n}
+
+
+def _advertised_hosts(routes: dict = None) -> set:
+    """The public names this site ALREADY advertises, read from `antie.toml`.
+
+    DO NOT HAND-CONFIGURE THIS (design ruling, 2026-08-20: *"Don't hand roll
+    fatmama_my_domains"*). The node already records its own public name: ANTIE's
+    `advertise` list carries `fatmama:<host>:2525`, and `deploy/deploy.py`
+    rewrites it per-node at deploy time (`SELF_ADVERTISE`). A separate
+    hand-maintained variable is a SECOND SOURCE OF TRUTH for a value the deploy
+    pipeline already owns — and two sources eventually disagree, silently, at the
+    only moment that matters.
+
+    Every route target is a maildir, and the config sits beside it in BOTH
+    layouts, so one relative path serves both:
+
+        <base>/maildir/inbox   ->   <base>/config/antie.toml
+        local : /home/user/axiom/axiom-first-penguin-alpha/{maildir,config}
+        remote: /home/user/axiom-node/{maildir,config}
+
+    Parsed textually rather than with a TOML reader: this needs one token from a
+    file ANTIE owns, and a parse error here must not stop mail being delivered.
+    """
+    hosts = set()
+    for maildir in (routes or {}).values():
+        try:
+            cfg = Path(maildir).parent.parent / "config" / "antie.toml"
+            if not cfg.is_file():
+                continue
+            for m in re.finditer(r"fatmama:([^:\"\']+):\d+", cfg.read_text()):
+                h = canonical_host(m.group(1))
+                if h:
+                    hosts.add(h)
+        except Exception:
+            continue          # a broken config must not stop delivery
+    return hosts
+
+
+def canonical_host(host: str) -> str:
+    """One spelling per host, so self-comparison cannot be fooled by form.
+
+    A FATMAMA host may be ANY name the operator picked, or a bare IP — never
+    assume a pattern (AXIOM_YPX-019 §5.2.1). RFC 5321 writes a bare IP as an
+    ADDRESS LITERAL in brackets, `user@[203.0.113.5]`, and IPv6 with a tag,
+    `user@[IPv6:2001:db8::1]`. `@[203.0.113.5]` and `@203.0.113.5` name the same
+    host and MUST compare equal, or a site fails to recognise its own mail.
+    """
+    h = host.strip().lower().rstrip(".")
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if h.startswith("ipv6:"):
+        h = h[5:]
+    return h
+
+
+def unwrap_delivery_address(addr: str, mine: set) -> str:
+    """Unwrap a dual-@ delivery address to the cluster address inside it.
+
+        alice@axiom.internal@mail.example.org  ->  alice@axiom.internal
+        alice@axiom.internal@[203.0.113.5]     ->  alice@axiom.internal
+
+    This is how a wallet's registered delivery address reaches it from ANOTHER
+    site: the outer domain routes the SMTP hop, the local part names the wallet.
+    The form is deliberately NOT a legal email address: a bare second '@' is
+    refused by every standard MTA, and that is the containment — this mail is
+    FATMAMA-to-FATMAMA only and must never enter real mail infrastructure
+    (AXIOM_YPX-019 §5.2.1).
+
+    Returns "" when `addr` is not a delivery address for THIS site. Four rules,
+    each load-bearing:
+
+      1. UNWRAP ONLY WHAT IS OURS. If the outer domain is not in `mine`, this is
+         another site's mail — return "" so it routes onward. Without this,
+         zeta would open and store a cheque addressed to a wallet at theta.
+      2. THE INNER ADDRESS STILL FACES THE DOOR. `is_cluster_recipient` applies
+         unchanged, so only @axiom / @axiom.internal pass. Unwrapping is a step
+         BEFORE the admission check, never an exemption from it.
+      3. EXACTLY ONCE. No recursion, so a nested wrap cannot be walked into a
+         loop or made to resolve somewhere unintended.
+      4. The CALLER must slug the returned INNER address. Slugging the wrapped
+         form would invent `fatmama-mailbox-alice-axiom-internal-node-example-...`,
+         a directory the wallet never polls — the cheque would be delivered,
+         acknowledged, and silently invisible.
+    """
+    inner, host = parse_delivery_address(addr)
+    # Rule 1 — not ours, not our business.
+    if not inner or host not in mine:
+        return ""
+    return inner
+
+
+async def handshake_ok(reader, writer, host: str, port: int) -> bool:
+    """Verify the peer advertises FATMAMA capability. Sender-side gate.
+
+    Design ruling, 2026-08-20: *"a sender need to receive special handshake before
+    send."* So this runs BEFORE `MAIL FROM` — nothing is transferred until the
+    peer has proved it is a FATMAMA.
+
+    A real mail server answers EHLO without `XAXIOM-FATMAMA`, so a forged
+    homebase pointed at one ends here: we disconnect having sent no message.
+    That is precisely what keeps our addresses off blocklists.
+    """
+    writer.write(f"EHLO {HOSTNAME}\r\n".encode())
+    await writer.drain()
+    saw = False
+    for _ in range(20):                       # bounded: never read forever
+        line = await asyncio.wait_for(reader.readline(), timeout=8)
+        if not line:
+            break
+        if FATMAMA_CAPABILITY.encode() in line.upper():
+            saw = True
+        if line[3:4] != b"-":                 # last line of the EHLO reply
+            break
+    if not saw:
+        log.warning(f"[cross-site] {host}:{port} did NOT advertise "
+                    f"{FATMAMA_CAPABILITY} — NOT a FATMAMA. Aborting WITHOUT "
+                    f"sending (§5.2.1). This is the guard that stops a forged "
+                    f"homebase turning us into a spam source.")
+    return saw
+
+
+async def cross_site_deliver(host: str, sender: str, rcpt: str,
+                             raw: bytes) -> bool:
+    """Deliver to another FATMAMA. Returns True only if it was accepted.
+
+    ORDER MATTERS and is the whole security property:
+      1. refuse forbidden ports   — never touch real mail infrastructure
+      2. connect
+      3. HANDSHAKE — peer must advertise FATMAMA capability
+      4. only then MAIL FROM / RCPT TO / DATA
+    A forged homebase therefore costs an attacker a TCP connect and an EHLO on a
+    non-mail port. It cannot deliver AXIOM mail into a third party's server,
+    which is the outcome that gets our addresses blocklisted.
+    """
+    # Always the protocol port; never anything the message asked for.
+    port = FATMAMA_PORT
+    # Kept as defence in depth even though `port` is now a constant — a layered
+    # guard is not retired just because one layer currently makes it
+    # unreachable ([[feedback_defense_in_depth_by_design]]).
+    if port in FORBIDDEN_SMTP_PORTS:
+        log.error(f"[cross-site] REFUSING to dial {host}:{port} — port is real "
+                  f"SMTP ({sorted(FORBIDDEN_SMTP_PORTS)}). A forged homebase "
+                  f"must never reach real mail infrastructure (§5.2.1).")
+        return False
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=10)
+    except Exception as e:
+        log.warning(f"[cross-site] {host}:{port} unreachable: {e!r} — message KEPT")
+        return False
+    try:
+        greet = await asyncio.wait_for(reader.readline(), timeout=8)
+        if not greet.startswith(b"220"):
+            log.warning(f"[cross-site] {host}:{port} bad greeting {greet[:40]!r} — abort")
+            return False
+        # ── THE GATE: nothing is sent until the peer proves it is a FATMAMA ──
+        if not await handshake_ok(reader, writer, host, port):
+            return False
+        async def cmd(c: str, expect: bytes = b"250") -> bool:
+            writer.write((c + "\r\n").encode()); await writer.drain()
+            r = await asyncio.wait_for(reader.readline(), timeout=15)
+            return r.startswith(expect)
+        if not await cmd(f"MAIL FROM:<{sender}>"): return False
+        if not await cmd(f"RCPT TO:<{rcpt}>"):     return False
+        if not await cmd("DATA", b"354"):          return False
+        body = raw.replace(b"\r\n.", b"\r\n..")        # dot-stuffing
+        writer.write(body)
+        if not body.endswith(b"\r\n"):
+            writer.write(b"\r\n")
+        writer.write(b".\r\n"); await writer.drain()
+        ok = (await asyncio.wait_for(reader.readline(), timeout=30)).startswith(b"250")
+        try:
+            writer.write(b"QUIT\r\n"); await writer.drain()
+        except Exception:
+            pass
+        if ok:
+            log.info(f"[cross-site] → {rcpt} via {host}:{port} ({len(raw)} bytes) ACCEPTED")
+        else:
+            log.warning(f"[cross-site] {rcpt} via {host}:{port} REFUSED — message KEPT")
+        return ok
+    except Exception as e:
+        log.warning(f"[cross-site] {host}:{port} error {e!r} — message KEPT")
+        return False
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+def parse_delivery_address(addr: str):
+    """Split a dual-@ delivery address into `(inner_cluster_address, host)`.
+
+    THE ONE PARSER for the wrapped form. The SMTP intake and the outbound
+    collector both go through here so they cannot disagree about what a delivery
+    address is — the intake decides whether to ACCEPT one, the collector decides
+    where to SEND one, and a disagreement would strand mail at one end.
+
+    Returns `("", "")` for anything that is not a delivery address. Does NOT
+    decide ownership: the caller compares `host` against its own names, because
+    the two callers want opposite answers (intake wants "is it mine", the
+    collector wants "whose is it").
+    """
+    if not addr or "@" not in addr:
+        return ("", "")
+    local, _, domain = addr.rpartition("@")
+    domain = canonical_host(domain)
+    local = local.strip()
+    # DUAL-@ form: the local part IS the inner address, verbatim.
+    #
+    #     alice@axiom.internal@node.example.com  ->  alice@axiom.internal
+    #
+    # ⚠ THIS IS DELIBERATELY NOT A LEGAL EMAIL ADDRESS, and that is the point
+    # (design ruling, 2026-08-20): *"Yes it will reject by MTA but it's only for fatmama
+    # to fatmama. Rejecting by other MTA is good thing."*
+    #
+    # `@axiom.internal` mail is FATMAMA-to-FATMAMA only and must NEVER enter real
+    # mail infrastructure. A bare second '@' is refused by every standard MTA, so
+    # the form CANNOT be relayed, cannot leak, and cannot get this site
+    # blocklisted — the containment is structural rather than a rule someone has
+    # to remember. An earlier draft used a VERP `=` separator precisely BECAUSE it
+    # survives any MTA; that was the wrong goal, inverted.
+    #
+    # A local part with no '@' is a plain mailbox on that host, not a delivery
+    # address — so this cannot swallow ordinary recipients.
+    if "@" not in local:
+        return ("", "")
+    inner = local.lower()
+    # The inner address faces the same admission check as any other recipient.
+    if not is_cluster_recipient(inner):
+        return ("", "")
+    return (inner, domain)
+
+
+def _mailbox_is_empty(maildir: Path) -> bool:
+    """True iff a maildir holds no MESSAGES.
+
+    ⚠ Test `new/` and `cur/`, NOT the maildir itself. A maildir always contains
+    the `new`/`cur`/`tmp` subdirectories, so `any(maildir.glob("*"))` is ALWAYS
+    true and a reclaim guarded on it can never fire — which is exactly what the
+    first version of §5.1 did (caught by test, 2026-08-20: a drained dev account
+    was not reclaimed). `new/` is what POP3 itself enumerates; `cur/` is checked
+    too so a partially-read mailbox is never reclaimed out from under a client.
+    """
+    try:
+        for sub in ("new", "cur"):
+            d = Path(maildir) / sub
+            if d.exists() and any(f.is_file() for f in d.iterdir()):
+                return False
+        return True
+    except Exception:
+        return False        # unreadable ⇒ do NOT reclaim
+
+
+# YPX-019 §5.2.1 — the capability a FATMAMA advertises in EHLO and a SENDING
+# FATMAMA REQUIRES before transferring anything. Proves capability, not
+# identity: a shared secret would also stop a fake FATMAMA catching misdirected
+# mail, but that yields an attacker only their own traffic, and a secret in a
+# public codebase leaks by construction.
+FATMAMA_CAPABILITY = "XAXIOM-FATMAMA"
+
+# NEVER dial these. A forged homebase must not be able to reach real mail
+# infrastructure — that is the outcome that gets a site blocklisted, and the
+# blocklist kills OUR OWN outbound mail, not the attacker's.
+FORBIDDEN_SMTP_PORTS = {25, 465, 587}
+
+# THE ONLY PORT A FATMAMA EVER SPEAKS ON. Not configurable, by ruling:
+# Design ruling 2026-08-20 — "we just force it 2525 no need to allow to change fatmama
+# port... It is not a public SMTP anyway."
+#
+# Note which half is fixed: the HOST is arbitrary (any name an operator picks,
+# or a bare IP — AXIOM_YPX-019 §5.2.1), the PORT is a protocol constant. Getting
+# that split backwards is the usual error. A fixed port is also what lets a plain
+# email address — which cannot carry a port — be a COMPLETE delivery address.
+#
+# Critically, this means the destination port NEVER comes from the message. A
+# message-supplied port would be an attacker-chosen dial target; there is no such
+# input any more.
+FATMAMA_PORT = 2525
+assert FATMAMA_PORT not in FORBIDDEN_SMTP_PORTS, "protocol port must never be real-SMTP"
+
+# Bound amplification: one message must not become sustained traffic at a
+# stranger's host.
+CROSS_SITE_MIN_INTERVAL_S = 2.0
+
+
+def parse_recipient(raw: bytes) -> str:
+    """Recipient from an ANTIE outbox message's `To:` header.
+
+    ANTIE's MaildirCarrier::send writes the raw RFC822 and IGNORES its `to`
+    argument, so the header is the only carrier of the recipient. Header-only is
+    acceptable here because this message never crossed a network — ANTIE wrote it
+    to a local directory that only this collector reads.
+    """
+    for line in raw.split(b"\n", 200)[:200]:
+        low = line.strip().lower()
+        if low.startswith(b"to:"):
+            v = line.split(b":", 1)[1].strip().decode("utf-8", "replace")
+            if "<" in v and ">" in v:
+                v = v[v.find("<") + 1:v.find(">")]
+            return v.strip().lower()
+        if not line.strip():
+            break          # end of headers
+    return ""
+
+
 def load_routes(routes_file: Path) -> dict:
     if not routes_file.exists():
         return {}
@@ -72,7 +447,9 @@ def load_routes(routes_file: Path) -> dict:
 class FatmamaServer:
     def __init__(self, routes, routes_file=None, port=DEFAULT_PORT,
                  http_port=DEFAULT_HTTP_PORT, pop3_port=DEFAULT_POP3_PORT,
-                 bind="127.0.0.1", mode="dev", ring_capacity=10000):
+                 bind="127.0.0.1", mode="dev", ring_capacity=10000,
+                 auto_create=False, outboxes=None, pop3_bind=None,
+                 pickup_base=None):
         self.routes = routes
         self.routes_file = routes_file
         self._routes_mtime = routes_file.stat().st_mtime if routes_file else 0
@@ -80,6 +457,34 @@ class FatmamaServer:
         self.http_port = http_port
         self.pop3_port = pop3_port
         self.bind = bind
+        # KI#105: POP3 is unauthenticated BY DESIGN (dumb dev router), so its
+        # reachability is the entire access control. SMTP 2525 must stay on the
+        # public bind on remotes (cross-site FATMAMA->FATMAMA delivery rides
+        # it), but nothing external needs POP3 — remote clients use real
+        # provider mailboxes. Default: POP3 binds LOOPBACK unless explicitly
+        # widened, so a public deployment closes the open mailbox instead of
+        # inheriting it.
+        self.pop3_bind = pop3_bind if pop3_bind is not None else "127.0.0.1"
+        # When True, an inbound message for an unregistered recipient
+        # auto-creates its mailbox (register-on-encounter) instead of being
+        # dropped. OFF by default so the local shared FATMAMA keeps its
+        # drop-unknown behaviour unchanged; a per-validator FATMAMA (e.g.
+        # zeta's) enables it via --auto-create so a wallet gets a mailbox on
+        # first contact with no separate registration step.
+        self.auto_create = auto_create
+        # ANTIE outbox directories this FATMAMA collects from (YPX-019 §6).
+        # Empty = collector disabled, i.e. today's behaviour unchanged.
+        self.outboxes = [Path(o) for o in (outboxes or [])]
+        # YPX-024: ANTIE's [pickup] base directory. When set, FATMAMA is a
+        # pickup AGENT (the first MUMMY deployment): it consumes
+        # `<base>/<domain>/new/` — the domain is the DIRECTORY NAME, so no
+        # header parsing decides routing. This SUPERSEDES the handrolled
+        # cross-site path's role for care-of mail; the To:-header unwrap in
+        # `_collect_outboxes` remains only as the receive-door for wrapped
+        # mail arriving FROM other sites.
+        self.pickup_base = Path(pickup_base) if pickup_base else None
+        # Per-destination dial timestamps — amplification bound (§5.2.1).
+        self._xsite_last = {}
         # "dev" allows the XAXIOM-REGISTER SMTP verb (Kiddo's
         # tester-onboarding shortcut). "production" rejects it with a
         # 502 — operator-curated routes only; new mailboxes are added
@@ -89,7 +494,6 @@ class FatmamaServer:
         self.stats = Counter()
         self.total_delivered = 0
         self.total_dropped = 0
-        self.total_http_popped = 0
         self.total_pop3_retrieved = 0
         self.bytes_total = 0
         self.bytes_by_recipient = Counter()
@@ -164,6 +568,55 @@ class FatmamaServer:
                         pass
         return n
 
+    # ── PROVENANCE: a marker FILE inside the mailbox, not a sidecar ──
+    # Design ruling, 2026-08-20: "perhaps you can have some sort of simple flag, or a
+    # way to identify the directory when auto create".
+    #
+    # Better than a separate index for four reasons: the provenance lives WITH
+    # the thing it describes; it survives independently of any other file;
+    # removing the directory removes the marker, so there is no orphan state to
+    # drift; and an operator can see it with `ls -a`. A sidecar is a second
+    # source of truth, and two sources eventually disagree (RULE 1).
+    AUTO_MARKER = ".fatmama-auto"
+
+    def _marker_path(self, maildir) -> Path:
+        # Marker sits beside `new/cur/tmp`, i.e. in the inbox dir itself.
+        return Path(maildir) / self.AUTO_MARKER
+
+    def _mark_auto(self, addr: str) -> None:
+        """Record that WE minted this account, so it MAY later be reclaimed."""
+        md = self.routes.get(addr.lower())
+        if not md:
+            return
+        try:
+            self._marker_path(md).write_text(
+                "auto-created by FATMAMA; safe to reclaim once drained (YPX-019 §5.1)\n")
+        except Exception as e:
+            log.warning(f"auto-marker write {addr}: {e}")
+
+    def _mark_registered(self, addr: str) -> None:
+        """PROMOTE to persistent by REMOVING the marker. An explicit
+        XAXIOM-REGISTER means a client depends on this route surviving — e.g. a
+        client app testing against the co-located FATMAMA, which pulls by POP3
+        and would lose routing if the account were reclaimed under it."""
+        md = self.routes.get(addr.lower())
+        if not md:
+            return
+        try:
+            self._marker_path(md).unlink(missing_ok=True)
+        except Exception as e:
+            log.warning(f"auto-marker clear {addr}: {e}")
+
+    def _is_auto_created(self, addr: str) -> bool:
+        """No marker ⇒ treated as REGISTERED ⇒ never reclaimed. That is the safe
+        default, and it is why every account predating this marker survives
+        untouched (design ruling: "when unsure, don't delete")."""
+        md = self.routes.get(addr.lower())
+        try:
+            return bool(md) and self._marker_path(md).exists()
+        except Exception:
+            return False
+
     def _register_route(self, email: str) -> bool:
         """Idempotently register `email` with a fresh maildir. Returns True
         if a new route was added, False if already registered.
@@ -197,6 +650,13 @@ class FatmamaServer:
             raise ValueError(f"register: empty local-part in {email!r}")
         if not domain:
             raise ValueError(f"register: empty domain in {email!r}")
+        # Defence in depth: the callers above reject first, but this is the
+        # documented canonical guard, so any FUTURE caller inherits the rule
+        # rather than reintroducing the hole.
+        if not is_cluster_recipient(addr):
+            raise ValueError(
+                f"register: {email!r} is outside the cluster domains "
+                f"{CLUSTER_DOMAINS} — FATMAMA is dev-only (YPX-019 §3.1)")
         if addr in self.routes:
             return False
         slug = re.sub(r"[^a-z0-9]+", "-", addr).strip("-") or "anon"
@@ -218,7 +678,20 @@ class FatmamaServer:
         POST /routes/delete cannot bypass this; the protection is enforced
         here, not in the UI."""
         try:
-            return "axiom-first-penguin-" in str(maildir)
+            if "axiom-first-penguin-" in str(maildir):
+                return True
+            # ⚠ LAYOUT-INDEPENDENT RULE (2026-08-20). The substring above only
+            # matches the LOCAL dev layout. On a remote box the validator's own
+            # route is `<deploy>/maildir/inbox` (e.g.
+            # /home/user/axiom-node/maildir/inbox), which contains no
+            # "axiom-first-penguin-" — so a remote validator's route was
+            # DELETABLE, and deleting it stops all inbound mail to that
+            # validator even though the directory survives.
+            #
+            # The durable rule: IF FATMAMA DID NOT CREATE THE MAILBOX, FATMAMA
+            # DOES NOT REMOVE ITS ROUTE. Only `fatmama-mailbox-<slug>` dirs are
+            # ours; everything else belongs to a validator or a wallet.
+            return not self._is_fatmama_managed_mailbox(maildir)
         except Exception:
             return False
 
@@ -299,14 +772,21 @@ class FatmamaServer:
         # POP3 listener — standard RFC 1939 protocol for inbound pull.
         # Lets the macOS AxiomKiddo reference app (and any real POP3
         # mail client) drain the env's maildir using the same wire
-        # protocol they'd use against a real mail server. The HTTP
-        # /pop endpoint above is the dev convenience; this is the
-        # production-shape path.
+        # protocol they'd use against a real mail server. POP3 is the
+        # ONLY mail-read path — reading mail over HTTP was removed
+        # (no-HTTP-to-validators rule; HTTP now serves monitoring only).
         pop3_server = await asyncio.start_server(
-            self._handle_pop3_client, self.bind, self.pop3_port,
+            self._handle_pop3_client, self.pop3_bind, self.pop3_port,
             limit=8 * 1024 * 1024)
-        log.info(f"FATMAMA POP3 listening on {self.bind}:{self.pop3_port}")
+        log.info(f"FATMAMA POP3 listening on {self.pop3_bind}:{self.pop3_port}")
 
+        if self.outboxes:
+            log.info(f"FATMAMA outbox collector watching {len(self.outboxes)} dir(s): "
+                     + ", ".join(str(o) for o in self.outboxes))
+            asyncio.create_task(self._collect_outboxes())
+        if self.pickup_base:
+            log.info(f"FATMAMA pickup agent (YPX-024 / MUMMY) watching {self.pickup_base}")
+            asyncio.create_task(self._collect_pickup())
         async with smtp_server, http_server, pop3_server:
             await asyncio.gather(
                 smtp_server.serve_forever(),
@@ -318,6 +798,7 @@ class FatmamaServer:
         """Minimal SMTP: just enough handshake, then dump bytes to maildir."""
         self._maybe_reload_routes()
         rcpt_to = None
+        mail_from = None   # logged on a DROP so an unroutable sender can be found
         peer = writer.get_extra_info("peername")
 
         try:
@@ -335,14 +816,26 @@ class FatmamaServer:
                 upper = cmd.split()[0].upper() if cmd.split() else ""
 
                 if upper in ("EHLO", "HELO"):
-                    writer.write(f"250 {HOSTNAME}\r\n".encode())
+                    # §5.2.1 — advertise so a sending FATMAMA can verify it is
+                    # talking to a FATMAMA BEFORE transferring. A real MTA never
+                    # advertises this, so a forged homebase aimed at someone's
+                    # mail server is disconnected before any message is sent.
+                    # HELO has no extension mechanism, so only EHLO carries it.
+                    if upper == "EHLO":
+                        writer.write(f"250-{HOSTNAME}\r\n".encode())
+                        writer.write(f"250 {FATMAMA_CAPABILITY}\r\n".encode())
+                    else:
+                        writer.write(f"250 {HOSTNAME}\r\n".encode())
                     await writer.drain()
 
                 elif upper == "XAXIOM-REGISTER":
                     # Dev-environment wallet onboarding (Kiddo "Register
                     # with FATMAMA" button). Adds <email> to routes so
                     # subsequent SMTP delivery queues for POP3 polling.
-                    # No auth — FATMAMA is single-tenant dev-LAN only.
+                    # No auth. ⚠ The "single-tenant dev-LAN" premise this rested
+                    # on is CURRENTLY FALSE — see KI#105: FATMAMA is bound
+                    # 0.0.0.0 on internet-facing boxes. Registration is
+                    # therefore reachable by strangers wherever 2525 is open.
                     #
                     # Production mode rejects this verb. Routes in
                     # production are operator-curated (edited in
@@ -359,8 +852,15 @@ class FatmamaServer:
                         writer.write(b"501 syntax error: XAXIOM-REGISTER <email>\r\n")
                         await writer.drain()
                         continue
+                    if not is_cluster_recipient(raw):
+                        log.warning(f"REJECT REGISTER {raw} (not @axiom/@axiom.internal)")
+                        writer.write(b"550 5.7.1 cluster domain only "
+                                     b"(@axiom / @axiom.internal)\r\n")
+                        await writer.drain()
+                        continue
                     try:
                         added = self._register_route(raw)
+                        self._mark_registered(raw)     # persistent — never reclaimed
                         if added:
                             log.info(f"REGISTER {raw} → {self.routes[raw]}")
                         writer.write(f"250 OK {raw} registered\r\n".encode())
@@ -370,6 +870,8 @@ class FatmamaServer:
                     await writer.drain()
 
                 elif upper == "MAIL":
+                    a, b = cmd.find("<"), cmd.find(">")
+                    mail_from = cmd[a + 1:b].strip().lower() if 0 <= a < b else None
                     writer.write(b"250 OK\r\n")
                     await writer.drain()
 
@@ -381,6 +883,27 @@ class FatmamaServer:
                         rcpt_to = cmd[start + 1:end].strip().lower()
                     elif ":" in cmd:
                         rcpt_to = cmd.split(":", 1)[1].strip().strip("<>").lower()
+                    # YPX-019 §3.1 — reject a non-cluster recipient IMMEDIATELY,
+                    # before routing and before any auto-create.
+                    # A delivery address wrapped for THIS site unwraps to the
+                    # wallet's real mailbox (YPX-019 §5.2.1). Done BEFORE the
+                    # cluster check, because the wrapped form's outer domain is
+                    # this host — it would otherwise be refused at the door as
+                    # "not @axiom.internal", which is how a cross-site cheque
+                    # bounces off the site that was supposed to receive it.
+                    if rcpt_to and not is_cluster_recipient(rcpt_to):
+                        unwrapped = unwrap_delivery_address(rcpt_to, my_domains(self.routes))
+                        if unwrapped:
+                            log.info(f"[delivery-address] {rcpt_to} → {unwrapped}")
+                            rcpt_to = unwrapped
+                    if rcpt_to and not is_cluster_recipient(rcpt_to):
+                        log.warning(f"REJECT {rcpt_to} (not @axiom/@axiom.internal — "
+                                    f"FATMAMA is dev-only, cluster-scoped)")
+                        writer.write(b"550 5.7.1 recipient not in cluster domain "
+                                     b"(@axiom / @axiom.internal only)\r\n")
+                        await writer.drain()
+                        rcpt_to = None
+                        continue
                     writer.write(b"250 OK\r\n")
                     await writer.drain()
 
@@ -419,7 +942,17 @@ class FatmamaServer:
                             lines[i] = line[1:]
                     message_data = b"\r\n".join(lines)
 
-                    # Route to recipient
+                    # Route to recipient. With --auto-create, an unregistered
+                    # recipient's mailbox is created on first encounter (no
+                    # separate registration step); otherwise unknown recipients
+                    # are dropped — default, so the local shared FATMAMA is
+                    # unchanged.
+                    if self.auto_create and rcpt_to and rcpt_to not in self.routes:
+                        try:
+                            self._register_route(rcpt_to)
+                            self._mark_auto(rcpt_to)   # transient — reclaimable
+                        except Exception as e:
+                            log.error(f"AUTO-CREATE FAILED {rcpt_to}: {e}")
                     if rcpt_to and rcpt_to in self.routes:
                         try:
                             fname = deliver_to_maildir(self.routes[rcpt_to], message_data)
@@ -437,7 +970,10 @@ class FatmamaServer:
                     elif rcpt_to:
                         self.total_dropped += 1
                         self._record_event("REJECT", rcpt_to, reason="no-route")
-                        log.warning(f"DROP {rcpt_to} (no route)")
+                        # Sender + Subject on the DROP line (2026-09-26): 83 mails to
+                        # `<validator>@axiom` were dropped on trustmesh and nothing
+                        # logged who sent them. `_DROP_RX` still matches (prefix).
+                        log.warning(drop_line(rcpt_to, mail_from, message_data))
 
                     writer.write(b"250 OK\r\n")
                     await writer.drain()
@@ -475,20 +1011,17 @@ class FatmamaServer:
     # box env) can't read the env's maildir directly. They pull pending
     # cheques over HTTP instead.
     #
-    # Endpoints:
-    #   GET /pop?wallet=<addr>[&max=<N>]
-    #     Drains up to N (default: all) pending messages for `wallet`,
-    #     returns JSON {"count": N, "messages": [{"filename": "...",
-    #     "data_b64": "..."}]}. Drained messages are DELETED from the
-    #     server-side maildir — the client now owns them.
-    #   GET /peek?wallet=<addr>
-    #     Returns {"count": N} without draining. Useful for poll-and-
-    #     decide flows ("don't bother fetching if there's nothing").
-    #   GET /health
-    #     Returns {"status":"ok","uptime_secs":N,"routes":M}.
+    # Endpoints (monitoring/admin ONLY — mail is NOT served over HTTP;
+    # reading mail is POP3 (2527), per the no-HTTP-to-validators rule):
+    #   GET  /health   {"status":"ok","uptime_secs":N,"routes":M}
+    #   GET  /stats, /routes, /events, /per-recipient[-lifetime]
+    #   POST /routes/delete, /routes/wipe  (route management)
     #
-    # No authentication. The dev env is single-tenant by design.
-    # Production deployments would put this behind a reverse proxy or
+    # No authentication. ⚠ "The dev env is single-tenant" is the SAME expired
+    # premise as the POP3 handler's — see KI#105. Wherever this HTTP port (2526)
+    # is publicly bound, route management is unauthenticated to the internet.
+    # It happens to be firewalled on all three remotes TODAY, which is luck, not
+    # design. Production deployments would put this behind a reverse proxy or
     # add token auth here.
     # ───────────────────────────────────────────────────────────────────
 
@@ -581,7 +1114,6 @@ class FatmamaServer:
                     "uptime_secs": uptime,
                     "routes": len(self.routes),
                     "delivered": self.total_delivered,
-                    "popped": self.total_http_popped,
                 })
                 return
 
@@ -597,7 +1129,6 @@ class FatmamaServer:
                     "routes": len(self.routes),
                     "delivered": self.total_delivered,
                     "dropped": self.total_dropped,
-                    "popped": self.total_http_popped,
                     "pop3_retrieved": self.total_pop3_retrieved,
                     "bytes_total": self.bytes_total,
                     "last_delivery_ts": self.last_delivery_ts,
@@ -710,38 +1241,9 @@ class FatmamaServer:
                 })
                 return
 
-            wallet = (qs.get("wallet", [""])[0] or "").lower()
-            if not wallet:
-                await self._http_send(writer, 400, {"error": "missing wallet"})
-                return
-            if wallet not in self.routes:
-                # Unknown route — return empty rather than error so the
-                # client can poll without spamming logs on mistyped names.
-                await self._http_send(writer, 200, {"count": 0, "messages": []})
-                return
-
-            inbox = self.routes[wallet] / "new"
-
-            if path == "/peek":
-                count = len(list(inbox.glob("*"))) if inbox.exists() else 0
-                await self._http_send(writer, 200, {"count": count})
-                return
-
-            if path == "/pop":
-                try:
-                    max_n = int(qs.get("max", ["0"])[0] or "0")
-                except ValueError:
-                    max_n = 0
-                count, msgs = self._drain_inbox(inbox, max_n)
-                self.total_http_popped += count
-                if count > 0:
-                    log.info(f"POP → {wallet} ({count} msg, max={max_n or 'all'})")
-                await self._http_send(writer, 200, {
-                    "count": count,
-                    "messages": msgs,
-                })
-                return
-
+            # Mail is NOT served over HTTP (no /pop, no /peek) — reading mail
+            # is POP3 (2527) only (no-HTTP-to-validators rule). Anything else
+            # is an unknown endpoint.
             await self._http_send(writer, 404, {"error": "no such endpoint"})
 
         except asyncio.TimeoutError:
@@ -785,8 +1287,210 @@ class FatmamaServer:
     # If the connection drops before QUIT, no deletes happen — exactly
     # RFC 1939 behaviour.
     #
-    # No TLS, no APOP, no authentication. Single-tenant dev env.
+    # ⚠ NO TLS, NO APOP, NO AUTHENTICATION — and the "single-tenant dev env"
+    # assumption this rested on HAS EXPIRED (KI#105, 2026-08-20).
+    #
+    # It was true when FATMAMA was one process on one workstation. It stopped
+    # being true when the same process was deployed to internet-facing boxes
+    # with `--bind 0.0.0.0`: POP3 2527 answers from the open internet on zeta,
+    # theta and iota, and a login with a DELIBERATELY WRONG password was
+    # ACCEPTED and served LIST. Any dev mailbox on any remote is world-readable.
+    #
+    # Nobody changed the auth model — the deployment moved out from under it.
+    # That is the failure mode to watch for: an assumption stated as a comment,
+    # left behind by an environment that changed around it.
+    #
+    # ⚠ TLS IS NOT THE FIX and would be actively misleading: encrypting a
+    # channel that accepts any password only makes an open mailbox private in
+    # transit. The gaps are (a) no authentication and (b) public reachability.
+    # See KI#105 for the three fix directions; the cheapest is to firewall 2527
+    # rather than to add crypto here.
+    #
+    # NOT fund-safety: Core validates every transaction and rejects anything
+    # injected (RULE 5 — the protocol is the security boundary, not the
+    # carrier). It IS information disclosure and DoS surface.
     # ───────────────────────────────────────────────────────────────────
+
+    async def _collect_outboxes(self):
+        """YPX-019 §6 / AntieOutboundSplit — collect what ANTIE wrote.
+
+        ANTIE's outbound job ends at writing a file; THIS is the other half.
+        Without a collector the outbox is a DEAD END: gateway.rs records replies
+        stranding on 7 of 10 validators, SILENTLY, because nothing drained it.
+
+        Local delivery only for now. A recipient this box does not host is LEFT
+        IN PLACE and logged once — never deleted — so cross-site delivery
+        (YPX-019 §5.2, homebase + mandatory handshake) can take it in the next
+        step without having lost anything.
+        """
+        warned = set()
+        while True:
+            # ⚠ RELOAD ROUTES HERE. Until 2026-08-20 the collector used the map
+            # captured at STARTUP, because `_maybe_reload_routes()` was called
+            # only from the SMTP/HTTP/POP3 handlers. That was invisible while any
+            # validator still PUSHED SMTP — each push incidentally refreshed the
+            # map, so the collector saw new wallet routes by side effect.
+            #
+            # The moment all validators moved to write-a-file, the last SMTP
+            # push disappeared and with it the only thing refreshing this view:
+            # replies to newly-registered wallets could never be matched, the
+            # outbox backed up, and soak funding stalled. A canary could NOT
+            # have caught this — it needs the LAST pusher to go away.
+            self._maybe_reload_routes()
+            moved = 0
+            for outbox in self.outboxes:
+                newdir = Path(outbox) / "new"
+                if not newdir.exists():
+                    continue
+                for f in sorted(newdir.iterdir()):
+                    if not f.is_file():
+                        continue
+                    try:
+                        raw = f.read_bytes()
+                    except FileNotFoundError:
+                        continue          # another pass took it
+                    rcpt = parse_recipient(raw)
+                    if not rcpt:
+                        if f.name not in warned:
+                            log.warning(f"[collect] {f.name}: no To: header — LEFT in place "
+                                        f"(never dropped); inspect it")
+                            warned.add(f.name)
+                        continue
+                    dest = self.routes.get(rcpt)
+                    if dest is None:
+                        # ── CROSS-SITE (YPX-019 §5.2) ──
+                        # Not hosted here. @axiom.internal ONLY: every other
+                        # domain routes by destination address
+                        # (PublicMailCarriers §2), and @axiom is soak-local.
+                        # ROUTE FROM THE DESTINATION ADDRESS (§5.2). The
+                        # receiver's own registered delivery address carries the
+                        # site; nothing is read from the subject, and the sender
+                        # cannot name where a third party's cheque goes.
+                        inner, host = parse_delivery_address(rcpt)
+                        if not inner:
+                            if f.name not in warned:
+                                log.warning(f"[collect] {rcpt}: not hosted here and not a "
+                                            f"delivery address (user@domain@host) — cannot "
+                                            f"route (§5.2). KEPT, not dropped.")
+                                warned.add(f.name)
+                            continue
+                        if host in my_domains(self.routes):
+                            # Wrapped for US — this is a local mailbox after all.
+                            local_dest = self.routes.get(inner)
+                            if local_dest is None:
+                                if f.name not in warned:
+                                    log.warning(f"[collect] {rcpt} unwraps to {inner}, which "
+                                                f"has no mailbox here. KEPT, not dropped.")
+                                    warned.add(f.name)
+                                continue
+                            try:
+                                deliver_to_maildir(local_dest, raw)
+                                f.unlink(); moved += 1; self.total_delivered += 1
+                                log.info(f"[collect] → {inner} (unwrapped from {rcpt}) "
+                                         f"delivered locally")
+                            except Exception as e:
+                                log.error(f"[collect] {inner}: delivery FAILED ({e}) — kept")
+                            continue
+                        # Rate-limit per destination: one message must not become
+                        # sustained traffic at a stranger's host.
+                        last = self._xsite_last.get(host, 0.0)
+                        if time.time() - last < CROSS_SITE_MIN_INTERVAL_S:
+                            continue                       # try again next pass
+                        self._xsite_last[host] = time.time()
+                        # ⚠ Do NOT log "dialing" here — the port guard and the
+                        # handshake both run INSIDE cross_site_deliver, and a
+                        # refused port never opens a socket. Claiming a dial we
+                        # did not make would read, in a log review, as though we
+                        # had connected to a stranger's mail server.
+                        log.info(f"[cross-site] routing {rcpt} via {host}:{FATMAMA_PORT} "
+                                 f"(a HINT from the subject — port guard and handshake "
+                                 f"decide whether anything is sent)")
+                        if await cross_site_deliver(host, f"fatmama@{HOSTNAME}",
+                                                    rcpt, raw):
+                            f.unlink()
+                            moved += 1
+                            self.total_delivered += 1
+                        # Not accepted ⇒ file stays. Never dropped.
+                        continue
+                    try:
+                        deliver_to_maildir(dest, raw)
+                        f.unlink()
+                        moved += 1
+                        self.total_delivered += 1
+                        log.info(f"[collect] → {rcpt} ({len(raw)} bytes) delivered locally")
+                    except Exception as e:
+                        log.error(f"[collect] {rcpt}: delivery FAILED ({e}) — left in place")
+            await asyncio.sleep(0.5 if moved else 2.0)
+
+    async def _collect_pickup(self):
+        """YPX-024: consume the ANTIE `[pickup]` directory — MUMMY, first cut.
+
+        ANTIE deposited a VERIFIED receiver-bound artifact at
+        `<base>/<domain>/new/<file>` and its job ended. This agent's whole
+        contract is that directory: the DOMAIN IS THE DIRECTORY NAME (no
+        header parsing chooses a destination — the sender-signed address
+        already did, and ANTIE verified it against the fingerprint).
+
+          - domain hosted HERE  → deliver into the recipient's local mailbox
+            (`To:` names the verified inner — the same header ANTIE built).
+          - domain elsewhere    → the existing cross-site leg: port guard +
+            mandatory XAXIOM-FATMAMA handshake + per-destination rate limit
+            (§5.2.1) decide whether anything is sent. Not accepted ⇒ the
+            file STAYS. Never dropped.
+
+        This supersedes the handrolled cross-site routing for care-of mail
+        (YPX-019 §5.2's To:-parse now only guards the RECEIVE door).
+        """
+        warned = set()
+        while True:
+            self._maybe_reload_routes()
+            moved = 0
+            base = self.pickup_base
+            if base and base.exists():
+                for domdir in sorted(p for p in base.iterdir() if p.is_dir()):
+                    domain = canonical_host(domdir.name)
+                    newdir = domdir / "new"
+                    if not newdir.exists():
+                        continue
+                    for f in sorted(newdir.iterdir()):
+                        if not f.is_file():
+                            continue
+                        try:
+                            raw = f.read_bytes()
+                        except FileNotFoundError:
+                            continue      # another pass took it
+                        if domain in my_domains(self.routes) \
+                                or domain in _advertised_hosts(self.routes):
+                            rcpt = parse_recipient(raw)
+                            dest = self.routes.get(rcpt) if rcpt else None
+                            if dest is None:
+                                if f.name not in warned:
+                                    log.warning(f"[pickup] {f.name}: recipient "
+                                                f"{rcpt!r} has no mailbox here — "
+                                                f"KEPT, not dropped")
+                                    warned.add(f.name)
+                                continue
+                            try:
+                                deliver_to_maildir(dest, raw)
+                                f.unlink(); moved += 1; self.total_delivered += 1
+                                log.info(f"[pickup] → {rcpt} delivered locally "
+                                         f"({domain}/{f.name})")
+                            except Exception as e:
+                                log.error(f"[pickup] {rcpt}: delivery FAILED ({e}) — kept")
+                            continue
+                        # Remote pickup domain — same amplification bound as
+                        # the outbox collector's cross-site leg.
+                        last = self._xsite_last.get(domain, 0.0)
+                        if time.time() - last < CROSS_SITE_MIN_INTERVAL_S:
+                            continue
+                        self._xsite_last[domain] = time.time()
+                        rcpt = parse_recipient(raw) or f"pickup@{domain}"
+                        if await cross_site_deliver(domain, f"fatmama@{HOSTNAME}",
+                                                    rcpt, raw):
+                            f.unlink(); moved += 1; self.total_delivered += 1
+                            log.info(f"[pickup] → {domain} cross-site ({f.name})")
+                        # Not accepted ⇒ file stays. Never dropped.
+            await asyncio.sleep(0.5 if moved else 2.0)
 
     async def _handle_pop3_client(self, reader, writer):
         self._maybe_reload_routes()
@@ -864,6 +1568,41 @@ class FatmamaServer:
                                     pass
                                 except Exception as e:
                                     log.warning(f"POP3 unlink {f.name}: {e}")
+                        # ── §5.1 ACCOUNT RECLAMATION (multi-site) ──
+                        # Auto-created dev accounts are TRANSIENT: created on
+                        # first qualifying message, reclaimed once their owner
+                        # has pulled the mail. Without this, a receiver
+                        # accumulates routes and empty mailboxes forever — zeta
+                        # already held 17 dead soak accounts on 2026-08-20.
+                        #
+                        # FOUR conditions, all required:
+                        #  (a) we actually DELETED something this session. An
+                        #      idle poll must never reclaim, or a routine empty
+                        #      check would churn a route that is about to
+                        #      receive mail.
+                        #  (b) the mailbox is now EMPTY.
+                        #  (c) it is fatmama-managed (`fatmama-mailbox-<slug>`),
+                        #      i.e. we created it.
+                        #  (d) it is not protected.
+                        # (c) and (d) are the SAME predicates the admin delete
+                        # path uses — one set of safety rules, not two (RULE 1).
+                        #
+                        # Co-located validators are unaffected: their maildirs
+                        # are read DIRECTLY FROM DISK, never over POP3, so this
+                        # path cannot reach them. Remote wallet accounts are the
+                        # only population it touches.
+                        if deleted:
+                            try:
+                                _md = self.routes.get(mailbox)
+                                if (_md and self._is_auto_created(mailbox)
+                                        and self._is_fatmama_managed_mailbox(_md)
+                                        and not self._is_protected_route(_md)
+                                        and _mailbox_is_empty(_md)):
+                                    self._delete_routes([mailbox], with_maildir=True)
+                                    log.info(f"POP3 → {mailbox}: drained and EMPTY — "
+                                             f"route + mailbox reclaimed (§5.1)")
+                            except Exception as _re:
+                                log.warning(f"POP3 reclaim {mailbox}: {_re!r}")
                         if deleted:
                             log.info(f"POP3 → {mailbox}: {len(deleted)} msg deleted on QUIT")
                     await send("+OK bye")
@@ -992,29 +1731,6 @@ class FatmamaServer:
                 pass
 
     @staticmethod
-    def _drain_inbox(inbox: Path, max_n: int):
-        """Move up to `max_n` (or all if 0) messages from inbox/new/ into the
-        response, deleting them from disk. Atomic per-message: we delete
-        only after successful read."""
-        if not inbox.exists():
-            return 0, []
-        files = sorted(inbox.glob("*"))
-        if max_n > 0:
-            files = files[:max_n]
-        msgs = []
-        for f in files:
-            try:
-                data = f.read_bytes()
-                f.unlink()
-                msgs.append({
-                    "filename": f.name,
-                    "data_b64": base64.b64encode(data).decode("ascii"),
-                })
-            except Exception as e:
-                log.warning(f"drain skip {f.name}: {e}")
-        return len(msgs), msgs
-
-    @staticmethod
     async def _http_send(writer, status: int, body: dict):
         body_bytes = json.dumps(body).encode("utf-8")
         reason = {200: "OK", 400: "Bad Request", 404: "Not Found",
@@ -1034,7 +1750,6 @@ class FatmamaServer:
         print(f"\nFATMAMA Stats (uptime: {uptime:.0f}s)")
         print(f"  Total delivered: {self.total_delivered}")
         print(f"  Total dropped:   {self.total_dropped}")
-        print(f"  HTTP popped:     {self.total_http_popped}")
         print(f"  POP3 retrieved:  {self.total_pop3_retrieved}")
 
 
@@ -1057,6 +1772,15 @@ _LOG_HDR_RX = re.compile(
     r"(?P<msg>.*)$"
 )
 _DELIVER_RX = re.compile(r"^DELIVER → (?P<addr>\S+) \((?P<bytes>\d+) bytes\)")
+def drop_line(rcpt_to, mail_from, message_data):
+    """The DROP log line: recipient, SMTP sender and Subject, so an unroutable
+    sender can be traced (added 2026-09-26). Starts with the `_DROP_RX` prefix."""
+    subj = next((l[8:].decode("utf-8", "replace").strip()[:80]
+                 for l in message_data.split(b"\r\n")[:40]
+                 if l[:8].lower() == b"subject:"), "")
+    return f"DROP {rcpt_to} (no route) from={mail_from or '?'} subject={subj!r}"
+
+
 _DROP_RX = re.compile(r"^DROP (?P<addr>\S+) \(no route\)")
 _POP_RX = re.compile(r"^POP → (?P<addr>\S+) \((?P<count>\d+) msg")
 _REGISTER_RX = re.compile(r"^REGISTER (?P<addr>\S+) →")
@@ -1181,15 +1905,31 @@ def cmd_serve(args):
         return 1
 
     log.info(f"Routes: {len(routes)} · mode={args.mode} · ring={args.ring_capacity}")
+    global _domains_file
+    _domains_file = args.routes.parent / DOMAINS_FILE_NAME
+    _extra = sorted(extra_domains())
+    if _extra:
+        log.warning(f"Test-domain list {_domains_file}: also accepting {', '.join(_extra)} "
+                    f"(carrier only — keep empty where these domains get REAL mail)")
     server = FatmamaServer(
         routes,
         routes_file=args.routes,
-        port=args.port,
+        # Forced, by ruling (2026-08-20): a FATMAMA listens on 2525 and
+        # nowhere else. Cross-site delivery dials FATMAMA_PORT unconditionally,
+        # so a site listening anywhere else is simply unreachable — silently, and
+        # only from other sites. Refusing at startup makes that a loud failure
+        # instead of a mystery. The flag is kept so existing launchers passing
+        # `--port 2525` keep working.
+        port=FATMAMA_PORT,
         http_port=args.http_port,
         pop3_port=args.pop3_port,
         bind=args.bind,
+        pop3_bind=args.pop3_bind,
         mode=args.mode,
         ring_capacity=args.ring_capacity,
+        auto_create=args.auto_create,
+        outboxes=args.outbox,
+        pickup_base=args.pickup_base,
     )
 
     def handle_signal(sig, frame):
@@ -1597,14 +2337,31 @@ def main():
 
     # serve (daemon — legacy default)
     p_serve = sub.add_parser("serve", help="run the FATMAMA daemon")
-    p_serve.add_argument("--port", type=int, default=DEFAULT_PORT,
-                         help=f"SMTP listen port (default {DEFAULT_PORT})")
+    p_serve.add_argument("--port", type=int, default=FATMAMA_PORT,
+                         help=f"SMTP listen port — MUST be {FATMAMA_PORT} (protocol constant)")
     p_serve.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT,
                          help=f"HTTP pull-endpoint port (default {DEFAULT_HTTP_PORT})")
     p_serve.add_argument("--pop3-port", type=int, default=DEFAULT_POP3_PORT,
                          help=f"POP3 listen port (default {DEFAULT_POP3_PORT})")
     p_serve.add_argument("--bind", default="127.0.0.1")
+    # KI#105: POP3 has NO authentication (dumb dev router), so its bind IS the
+    # access control. It defaults to loopback regardless of --bind; pass
+    # --pop3-bind explicitly to widen it (the local test box does, remotes
+    # must not — their clients use real provider mailboxes).
+    p_serve.add_argument("--pop3-bind", default=None, metavar="ADDR",
+                         help="POP3 bind address (default 127.0.0.1 — POP3 is "
+                              "unauthenticated; loopback is the access control)")
     p_serve.add_argument("--routes", type=Path, required=True)
+    p_serve.add_argument("--outbox", action="append", default=[], metavar="DIR",
+                         help="ANTIE outbox maildir to COLLECT from (repeatable). "
+                              "ANTIE writes there and stops; this drains it. Without "
+                              "a collector the outbox is a dead end — see YPX-019 §6.")
+    p_serve.add_argument("--pickup-base", type=Path, default=None, metavar="DIR",
+                         help="YPX-024: ANTIE's [pickup] base directory. When set, "
+                              "FATMAMA runs as the pickup agent (MUMMY, first cut): "
+                              "consumes <DIR>/<domain>/new/ — local domains deliver "
+                              "to mailboxes, remote domains ride the guarded "
+                              "cross-site leg.")
     p_serve.add_argument("--log-file", type=Path, default=None)
     p_serve.add_argument("--quiet", "-q", action="store_true")
     p_serve.add_argument(
@@ -1616,6 +2373,13 @@ def main():
         "--ring-capacity", type=int, default=10000,
         help="In-memory event ring buffer size for /events endpoint "
              "(default 10000, ~2MB at ~200B/event)",
+    )
+    p_serve.add_argument(
+        "--auto-create", action="store_true",
+        help="Auto-create a mailbox for an unregistered recipient on first "
+             "inbound message (register-on-encounter) instead of dropping it. "
+             "OFF by default (local shared FATMAMA drops unknowns unchanged); "
+             "enabled by a per-validator FATMAMA such as zeta's.",
     )
 
     # status
@@ -1670,6 +2434,12 @@ def main():
     if args.cmd is None:
         parser.print_help()
         return 0
+    # Loud, not silent: a site listening anywhere but 2525 is unreachable from
+    # every other site, because cross-site delivery dials the constant.
+    if getattr(args, "port", FATMAMA_PORT) != FATMAMA_PORT:
+        parser.error(f"--port must be {FATMAMA_PORT} — FATMAMA's port is a protocol "
+                     f"constant, not an operator choice. (The HOST is yours to pick; "
+                     f"the port is not.)")
     if args.cmd == "serve":
         return cmd_serve(args)
     if args.cmd == "status":

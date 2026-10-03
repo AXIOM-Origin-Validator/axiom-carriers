@@ -30,7 +30,8 @@
 //! antie --init-maildir ./test-maildir
 //! ```
 
-#[cfg(feature = "jemalloc")]
+// KI#86 / KI#23: jemalloc always-on — glibc arena retention under carrier churn.
+// Was a ghost: the `jemalloc` feature was optional and never enabled in any build.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -93,6 +94,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Core is the sole authority for platform safety. Since ANTIE
     // executes core-logic directly via AVM, the check must run here.
     axiom_core_logic::verify_time_safety();
+    // KI#240: name the register twin set this binary was compiled with. The print is
+    // also what keeps the marker bytes in the binary, which verify_deploy.sh greps
+    // and compares against the ELF's profile — do not remove it.
+    eprintln!("core/logic tuning profile: {}", axiom_core_logic::version::TUNING_PROFILE_MARKER);
 
     let cli = Cli::parse();
 
@@ -196,11 +201,11 @@ fn print_banner(config: &AntieConfig) {
     if let Some(c) = &config.carriers.maildir {
         println!("    Maildir   inbox={}", c.inbox.display());
     }
-    if let Some(c) = &config.carriers.imap {
-        println!("    IMAP      {}:{} user={}", c.server, c.port, c.username);
+    for c in &config.carriers.imap {
+        println!("    IMAP      {}:{} user={}{}", c.server, c.port, c.username, if c.enabled { "" } else { "  (disabled)" });
     }
-    if let Some(c) = &config.carriers.pop3 {
-        println!("    POP3      {}:{} user={}", c.server, c.port, c.username);
+    for c in &config.carriers.pop3 {
+        println!("    POP3      {}:{} user={}{}", c.server, c.port, c.username, if c.enabled { "" } else { "  (disabled)" });
     }
     if !config.carriers.advertise.is_empty() {
         println!("  {} Advertised (discovery URIs only — ANTIE doesn't parse):", "Hints:".green());
@@ -209,9 +214,13 @@ fn print_banner(config: &AntieConfig) {
         }
     }
 
-    if let Some(s) = &config.outbound.smtp {
-        println!("  {} SMTP {}:{} from={}",
+    if let Some(s) = &config.outbound.local {
+        println!("  {} local {}:{} from={} (@axiom/@axiom.internal)",
             "Outbound:".green(), s.server, s.port, s.from_address);
+    }
+    if let Some(s) = &config.outbound.external {
+        println!("  {} external relay {}:{} (real domains)",
+            "Outbound:".green(), s.server, s.port);
     }
 
     match &config.lambda {

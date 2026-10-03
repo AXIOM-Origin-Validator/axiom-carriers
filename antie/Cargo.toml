@@ -15,15 +15,16 @@ name = "axiom_antie"
 path = "src/lib.rs"
 
 [dependencies]
+socket2 = "0.5"
 # Core validation
-axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a" }
+axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-d1e5cb67" }
 # Structured error responses (AXIOM_YellowPaper_Errors.md Phase 2c.3).
 axiom-errors = { workspace = true, features = ["std"] }
-axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.7.1" }
 # Shared per-IP TCP rate limiter (single source, also used by Lambda)
-axiom-rate-limit = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+axiom-rate-limit = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.7.1" }
 # AVM interpreter for direct CL2 execution (no core-bin subprocess)
-axiom-dmap-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = true, features = ["riscv-interpreter"] }
+axiom-dmap-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-d1e5cb67", default-features = true, features = ["riscv-interpreter"] }
 
 # Async runtime
 tokio = { version = "1.0", features = ["full", "fs"] }
@@ -95,7 +96,7 @@ rustls-pemfile = "2"
 chrono = "0.4"
 
 # Allocator — jemalloc returns memory to OS properly (glibc fragments)
-tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemallocator = "0.6"   # KI#86: always-on (was a ghost — feature never enabled in any build)
 
 # KI#23 mitigation — periodic `malloc_trim(0)` against glibc arena
 # retention. See `antie/src/malloc_trim.rs` for the rationale + the
@@ -105,8 +106,10 @@ libc = "0.2"
 [features]
 disable-audit = ["axiom-dmap-vm/disable-audit"]
 cranelift-jit = ["axiom-dmap-vm/cranelift-jit-backend"]
-jemalloc = ["tikv-jemallocator"]
+jemalloc = []   # KI#86: no-op kept for compat; tikv-jemallocator is now non-optional/always-on
 
 [dev-dependencies]
 tempfile = "3.0"
+# KI#114: paused-clock tests (`tokio::time::pause`) drive the heartbeat bounds.
+tokio = { version = "1.0", features = ["test-util"] }
 proptest = "1.4"
